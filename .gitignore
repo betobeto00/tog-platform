@@ -16,3 +16,7 @@ Thumbs.db
 
 # Graphify
 graphify-out/
+
+# Dependencias y datos locales de desarrollo
+node_modules/
+data/

@@ -1,0 +1,17 @@
+{
+  "name": "tog-platform",
+  "version": "0.1.0",
+  "description": "Backend de licencias TOG Platform — emisión y activación de módulos por licencia firmada RSA",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test \"src/*.test.js\"",
+    "test:sign": "node src/sign.js --self-test"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "license": "MIT"
+}
