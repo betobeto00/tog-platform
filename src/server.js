@@ -73,27 +73,41 @@ async function handle(req, res) {
   }
 
   // POST /api/empresas  (admin) — alta inicial de empresa, genera api_key
+  // Identificación internacional: pais (ISO 3166-1 alpha-2) + documento de
+  // registro/tributario (RIF, EIN, NIT, CUIT, CNPJ, VAT…). Un mismo número en
+  // países distintos es válido; duplicado solo dentro del mismo país.
   if (method === 'POST' && path === '/api/empresas') {
     if (!requireAdmin(req, res)) return
     const body = await readBody(req)
-    if (!body?.nombre || !body?.rif || !body?.email_contacto) {
-      return json(res, 400, { success: false, error: 'nombre, rif y email_contacto son requeridos' })
+    const nombre = typeof body?.nombre === 'string' ? body.nombre.trim() : ''
+    const pais = (typeof body?.pais === 'string' ? body.pais.trim().toUpperCase() : 'VE') || 'VE'
+    // Canónico en mayúsculas: los documentos tributarios/registrales no distinguen caja
+    const documento = typeof body?.documento === 'string' ? body.documento.trim().toUpperCase() : ''
+    const emailContacto = typeof body?.email_contacto === 'string' ? body.email_contacto.trim() : ''
+    if (!nombre || !documento || !emailContacto) {
+      return json(res, 400, { success: false, error: 'nombre, documento y email_contacto son requeridos' })
+    }
+    if (!/^[A-Z]{2}$/.test(pais)) {
+      return json(res, 400, { success: false, error: 'pais debe ser un código ISO 3166-1 alpha-2 (ej: VE, US, AR, CO)' })
+    }
+    if (documento.length > 40 || nombre.length > 200) {
+      return json(res, 400, { success: false, error: 'nombre (máx 200) o documento (máx 40) excede el largo permitido' })
     }
     const apiKey = crypto.randomBytes(16).toString('hex')
     try {
       const result = db
-        .prepare('INSERT INTO empresas (nombre, rif, email_contacto, api_key) VALUES (?, ?, ?, ?)')
-        .run(body.nombre, body.rif, body.email_contacto, apiKey)
+        .prepare('INSERT INTO empresas (nombre, pais, documento, email_contacto, api_key) VALUES (?, ?, ?, ?, ?)')
+        .run(nombre, pais, documento, emailContacto, apiKey)
       return json(res, 201, { success: true, id: result.lastInsertRowid, api_key: apiKey })
     } catch (err) {
-      return json(res, 409, { success: false, error: `RIF duplicado o inválido: ${err.message}` })
+      return json(res, 409, { success: false, error: `Documento duplicado para el país ${pais}: ${err.message}` })
     }
   }
 
   // GET /api/admin/empresas  (admin) — listado
   if (method === 'GET' && path === '/api/admin/empresas') {
     if (!requireAdmin(req, res)) return
-    const rows = db.prepare('SELECT id, nombre, rif, email_contacto, created_at FROM empresas ORDER BY created_at DESC').all()
+    const rows = db.prepare('SELECT id, nombre, pais, documento, email_contacto, created_at FROM empresas ORDER BY created_at DESC').all()
     return json(res, 200, { empresas: rows })
   }
 

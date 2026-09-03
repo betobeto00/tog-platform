@@ -66,7 +66,7 @@ test('GET /api/health reporta DB y clave de firma disponibles', async () => {
 })
 
 test('endpoints de admin y empresa rechazan sin credenciales', async () => {
-  const sinKey = await post('/api/empresas', { nombre: 'X', rif: 'J-1', email_contacto: 'x@x.com' })
+  const sinKey = await post('/api/empresas', { nombre: 'X', documento: 'J-1', email_contacto: 'x@x.com' })
   assert.equal(sinKey.status, 401)
 
   const licenciaSinKey = await post('/api/empresas/1/licencias', { cliente: 'X', expira: '2099-12-31' })
@@ -76,10 +76,10 @@ test('endpoints de admin y empresa rechazan sin credenciales', async () => {
   assert.equal(listado.status, 401)
 })
 
-test('alta de empresa: crea con api_key, rechaza RIF duplicado, lista con admin', async () => {
+test('alta de empresa: crea con api_key, rechaza documento duplicado en el mismo país', async () => {
   const created = await post(
     '/api/empresas',
-    { nombre: 'AgroMaíz C.A.', rif: 'J-12345678-9', email_contacto: 'admin@agromaiz.com' },
+    { nombre: 'AgroMaíz C.A.', pais: 'VE', documento: 'J-12345678-9', email_contacto: 'admin@agromaiz.com' },
     adminHeaders,
   )
   assert.equal(created.status, 201)
@@ -88,19 +88,51 @@ test('alta de empresa: crea con api_key, rechaza RIF duplicado, lista con admin'
 
   const duplicado = await post(
     '/api/empresas',
-    { nombre: 'Otra', rif: 'J-12345678-9', email_contacto: 'otra@x.com' },
+    { nombre: 'Otra', pais: 've', documento: 'j-12345678-9', email_contacto: 'otra@x.com' }, // normaliza a VE / mayúsculas
     adminHeaders,
   )
   assert.equal(duplicado.status, 409)
 
-  const invalido = await post('/api/empresas', { nombre: 'Sin rif' }, adminHeaders)
-  assert.equal(invalido.status, 400)
+  const sinDocumento = await post('/api/empresas', { nombre: 'Sin documento' }, adminHeaders)
+  assert.equal(sinDocumento.status, 400)
+
+  const paisInvalido = await post(
+    '/api/empresas',
+    { nombre: 'X', pais: 'Venezuela', documento: 'J-1', email_contacto: 'x@x.com' },
+    adminHeaders,
+  )
+  assert.equal(paisInvalido.status, 400)
 
   const list = await fetch(base + '/api/admin/empresas', { headers: adminHeaders })
   assert.equal(list.status, 200)
   const { empresas } = await list.json()
   assert.equal(empresas.length, 1)
-  assert.equal(empresas[0].rif, 'J-12345678-9')
+  assert.equal(empresas[0].pais, 'VE')
+  assert.equal(empresas[0].documento, 'J-12345678-9')
+})
+
+test('identidad internacional: mismo documento en países distintos son empresas distintas', async () => {
+  const us = await post(
+    '/api/empresas',
+    { nombre: 'Corn Flakes LLC', pais: 'US', documento: '12-3456789', email_contacto: 'ops@cornflakes.com' },
+    adminHeaders,
+  )
+  assert.equal(us.status, 201)
+
+  const ar = await post(
+    '/api/empresas',
+    { nombre: 'Copos de Maíz S.A.', pais: 'AR', documento: '12-3456789', email_contacto: 'ventas@copos.com.ar' },
+    adminHeaders,
+  )
+  assert.equal(ar.status, 201)
+  assert.notEqual(us.json.id, ar.json.id)
+
+  const usDeNuevo = await post(
+    '/api/empresas',
+    { nombre: 'Otra LLC', pais: 'US', documento: '12-3456789', email_contacto: 'otra@cornflakes.com' },
+    adminHeaders,
+  )
+  assert.equal(usDeNuevo.status, 409)
 })
 
 test('emisión manual de licencia: firma RSA válida y consultable por la empresa', async () => {
@@ -135,7 +167,7 @@ test('licencia: api_key desconocida → 401, empresa sin licencia → 404', asyn
 
   const creada = await post(
     '/api/empresas',
-    { nombre: 'Sin Licencia', rif: 'J-99999999-9', email_contacto: 'nuevo@x.com' },
+    { nombre: 'Sin Licencia', pais: 'PE', documento: '20-99999999-9', email_contacto: 'nuevo@x.com' },
     adminHeaders,
   )
   assert.equal(creada.status, 201)

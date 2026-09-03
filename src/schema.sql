@@ -1,14 +1,19 @@
 -- Esquema del backend TOG Platform (SQLite, modelado sobre docs/FACTURACION-STRIPE.md)
 -- Adaptado de UUIDs/Postgres a INTEGER/SQLite para el MVP sin infraestructura.
 
+-- Identificación internacional de la empresa: pais (ISO 3166-1 alpha-2) +
+-- documento de registro/tributario libre (RIF, EIN, NIT, CUIT, CNPJ, VAT…).
+-- El mismo número en países distintos son empresas distintas.
 CREATE TABLE IF NOT EXISTS empresas (
   id                 INTEGER PRIMARY KEY AUTOINCREMENT,
   nombre             TEXT NOT NULL,
-  rif                TEXT UNIQUE NOT NULL,
+  pais               TEXT NOT NULL DEFAULT 'VE',
+  documento          TEXT NOT NULL,
   email_contacto     TEXT NOT NULL,
   api_key            TEXT UNIQUE NOT NULL,
   stripe_customer_id TEXT UNIQUE,
-  created_at         TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (pais, documento)
 );
 
 -- Historial completo de licencias emitidas (no solo la actual)
