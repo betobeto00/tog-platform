@@ -25,7 +25,7 @@ La visión de **TOG Platform** es que cada eslabón sea un **módulo activable p
 | 1 | **Productor** | 🟡 Diseño | Siembra, costos de campo, estimación de cosecha, logística de acopio | Core |
 | 2 | **Procesador** | 🟡 Diseño | Recepción de materia prima, recetas/BOM, transformación, mermas, lote de salida | Core + Productor (opcional) |
 | 3 | **Comercializador** | ✅ Parcial (`tog-admin`) | Inventario, compras, ventas, cotizaciones, caja, POS | Core |
-| 4 | **Distribuidor** | ✅ MVP — CRUD de clientes (`tog-admin`, 2026-09); pedidos en construcción | Clientes (con documento de registro internacional), pedidos, remitos, listas de precio, crédito. Rutas, flotas y despachos pendientes | Core + Comercializador |
+| 4 | **Distribuidor** | ✅ MVP v1 — clientes + pedidos CRUD (`tog-admin`, 2026-09; migraciones 015/016, gating por licencia, tests) | Clientes (documento de registro internacional: RIF, RFC, EIN…), pedidos con numeración y estados. Pendientes: remitos, listas de precio, crédito; rutas, flotas y despachos | Core + Comercializador |
 | 5 | **Postventa** | 🟡 Diseño | Tickets de soporte, devoluciones, garantías, notas de crédito | Core + Comercializador |
 
 **Leyenda**: ✅ existe · 🟡 en diseño · ⚪ no iniciado
@@ -55,6 +55,8 @@ Una licencia es un JSON firmado RSA (la clave pública ya está embebida en `lic
 }
 ```
 
+> ⚠️ **Estado real (2-Sep-2026):** el JSON de arriba es la **visión de producto** (identidad empresa = `pais` ISO 3166-1 + `documento` de registro libre). El backend emite licencias firmadas con esta identidad (ver `src/server.js` / `src/sign.js`); la app las valida con la clave pública embebida (`tog-admin` → `src/main/services/license-crypto.ts`) y el gating de módulos es real (`useActiveModules` + permisos). El formato exacto de la licencia que guarda la app está en `tog-admin/docs/LICENCIAMIENTO.md`.
+
 El **Core** siempre está implícito. Si el cliente desactiva "Comercializador", el módulo sigue instalado pero el Sidebar y los handlers se ocultan.
 
 ### 3.2 Tipos de edición
@@ -73,9 +75,11 @@ Las ediciones son **bundles comerciales**. Internamente, la licencia sigue siend
 
 ### 3.3 Cómo se entrega una licencia nueva / activación de módulo
 
-**Hoy (offline, manual)**: tú generas la clave firmada (script `tools/sign-license.ts` en el repo del Core) y la envías por correo/WhatsApp. Roberto la pega en `Configuración → Licencia → Cargar clave`, reinicia, módulo activo.
+**Hoy (v1 manual)** — dos caminos, ambos con validación RSA local:
+1. **Offline**: tú emites la clave firmada (endpoint `POST /api/empresas/:id/licencias` de este backend, o `scripts/generate-license.js` en tog-admin) y la envías por WhatsApp/correo; Roberto la importa desde la pantalla de bloqueo o desde Configuración.
+2. **Online (Sincronizar)**: Roberto abre TOG Admin → Config → Licencia → **Sincronizar** (URL + ID de empresa + API Key) y la app descarga la licencia activa. Probado de punta a punta (ver `README.md` y `tog-admin/docs/QA-SYNC.md`).
 
-**Mañana (online, automático)**: Roberto paga con tarjeta vía Stripe Checkout. El webhook de Stripe llega a tu backend, el backend actualiza el estado de la empresa y le entrega la nueva clave. Detalle en `FACTURACION-STRIPE.md`.
+**En espera (online automático con pago)**: Roberto paga con tarjeta vía Stripe Checkout; el webhook reactiva/renueva la licencia automáticamente. Código implementado y testeado en este repo (`src/stripe.js`, webhooks, grace period), **pausado** hasta que un cliente quiera pagar online. Detalle en `FACTURACION-STRIPE.md`.
 
 ### 3.4 Offline-first, online-cuando-puede
 
@@ -169,16 +173,18 @@ Estos números son una **referencia para el roadmap**, no la tabla de precios fi
 
 ## 7. Roadmap por módulo
 
-### Inmediato (mes 0–2): habilitar el catálogo
-- [ ] Estandarizar `window.api.modules` desde la licencia activa.
-- [ ] Sidebar filtra items según módulos.
-- [ ] Config → Licencia muestra catálogo de módulos disponibles (algunos en gris "No adquirido").
-- [ ] Backend admin web (Vercel + Postgres) con CRUD de empresas y licencias.
+### Inmediato (mes 0–2): habilitar el catálogo — ✅ hecho (2-Sep-2026)
+- [x] Catálogo de módulos desde la licencia activa (`src/shared/modules.ts` + `useActiveModules` en tog-admin).
+- [x] Sidebar/Router/IPC filtran según módulos de la licencia y permisos.
+- [x] Config → Licencia muestra el catálogo y estado de módulos.
+- [x] Backend (este repo, SQLite) con CRUD de empresas (`pais` + `documento`) y emisión de licencias firmadas.
 
 ### Corto plazo (mes 2–6): Distribuidor + Stripe
-- [ ] Módulo Distribuidor: tabla `clientes`, `pedidos`, `remitos`, `rutas`, `listas_precio`.
-- [ ] Integración Stripe Checkout + webhooks.
-- [ ] Renovación automática online.
+- [x] Módulo Distribuidor: tablas `clientes`, `pedidos`, `pedido_detalles`, `remitos`, `listas_precio` (migraciones 015/016).
+- [x] CRUD de clientes y pedidos (numeración secuencial, estados) con tests.
+- [ ] Remitos y listas de precio con UI; crédito a clientes; rutas/flotas/despachos.
+- [x] Integración Stripe Checkout + webhooks + grace period — ⏸️ **EN ESPERA** de cliente que pague online.
+- [ ] Renovación automática online (idem, EN ESPERA).
 
 ### Medio plazo (mes 6–12): Productor + Procesador
 - [ ] Módulo Productor: siembras, cosechas, costos de campo.

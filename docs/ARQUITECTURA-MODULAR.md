@@ -1,6 +1,8 @@
 # TOG Platform — Arquitectura Modular
 
 > Documento técnico. Define cómo el Core carga módulos activados por licencia, cómo se comunican los módulos entre sí, cómo el Sidebar/Route/IPC reaccionan, y qué cambios concretos requiere el código actual de TOG Admin.
+>
+> 📌 **Estado real (2-Sep-2026):** este documento es la **visión de diseño** de un cargador genérico (loader/registry/manifiesto). La implementación real es más liviana y vive en **`tog-admin`**: handlers por módulo en `src/main/modules/<módulo>/`, catálogo en `src/shared/modules.ts`, gating con `useActiveModules` (licencia) + `usePermissions` (permisos) en el renderer y `checkPermissionOrFail` en el main — ver `tog-admin/docs/ARCHITECTURE.md`. Hoy el único módulo activable por licencia es **Distribuidor** (clientes + pedidos); Comercializador es el Core.
 
 ---
 

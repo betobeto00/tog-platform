@@ -94,10 +94,9 @@ Cuando llegue el momento de la nube, **no hay reescritura**: solo se cambia la i
 | ✅ 0 | Limpieza del repo TOG Admin (token GH residual, permisos backend) |
 | ✅ 1 | Backend de licencias en este repo (SQLite + firma RSA) — ver sección siguiente |
 | ✅ 1 | Sincronización licencia local ↔ backend (canal pre-auth `license:sync` en Config y bloqueo) |
-| ✅ 5 | Módulo Distribuidor MVP en tog-admin (CRUD clientes; pedidos en construcción) |
-| ⏸️ 2 | Stripe Checkout MVP **en espera**: implementado y testeado, pero no se avanza hasta que un cliente quiera pagar online |
-| 🟡 3 | Webhooks de Stripe + grace period |
-| 🟡 4 | Customer Portal + panel admin web mínimo |
+| ✅ 5 | Módulo Distribuidor MVP en tog-admin (clientes + pedidos; gating por licencia; flujo Sincronizar validado e2e con `qa-sync`) |
+| ⏸️ 2 | Stripe Checkout + webhooks + grace period de 14 días — **implementados y testeados, en espera** hasta que un cliente quiera pagar online |
+| 🟡 3 | Customer Portal + panel admin web mínimo |
 
 ## Qué es HOY (flujo manual) y qué está EN ESPERA
 

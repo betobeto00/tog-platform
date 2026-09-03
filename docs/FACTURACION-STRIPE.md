@@ -1,6 +1,8 @@
 # TOG Platform — Facturación y Sincronización de Licencia con Stripe
 
 > Documento técnico de la integración entre **pagos (Stripe)** y **licencias (TOG Platform)**. El flujo de licenciamiento puro está en `MODULOS.md`; la arquitectura modular está en `ARQUITECTURA-MODULAR.md`. Este doc los conecta.
+>
+> 🅿️ **Estado (2-Sep-2026): EN ESPERA** — decisión de alcance anti-overengineering (ver `README.md` → “Qué es HOY… y qué está EN ESPERA”). Lo descrito aquí es el **diseño** del flujo online; la implementación real (Node + SQLite, cero dependencias: `src/server.js`, `src/stripe.js`, webhooks idempotentes con grace period) ya existe y tiene 19 tests, pero **no se avanza** (Customer Portal, emails, panel web) hasta que un cliente quiera pagar online. Hoy se opera con el flujo manual + botón Sincronizar.
 
 ---
 
@@ -305,10 +307,10 @@ export function verifyLicense(licenseString: string): LicensePayload | null {
 4. Copiar `license_public.pem` al código de TOG Admin (reemplazar la actual).
 5. Desplegar en Vercel/Railway/Fly.io.
 
-### En TOG Admin
-1. Reemplazar `PUBLIC_KEY` en `src/main/services/license.ts` con la nueva clave pública.
-2. Agregar endpoint de sincronización en `Config → Licencia → Sincronizar` que llama a `GET /api/empresas/:id/licencia`.
-3. Manejar el deep link `tog-admin://licencia/actualizada` (registrar protocolo en NSIS installer).
+### En TOG Admin (estado 2-Sep-2026)
+1. ✅ Clave pública embebida + verificación RSA: hecha y extraída a `src/main/services/license-crypto.ts` (unit-tested).
+2. ✅ Botón **Sincronizar** en Config y pantalla de bloqueo (canal pre-auth `license:sync` → `GET /api/empresas/:id/licencia`): implementado en `src/main/services/license-sync.ts`.
+3. ⏳ Deep link `tog-admin://licencia/actualizada` (protocolo custom en NSIS) — solo haría falta en el flujo online; EN ESPERA.
 
 ---
 
@@ -330,16 +332,16 @@ A 10 clientes en Distribuidor: **$234/mes pasivos**. A 50: **$1170/mes pasivos**
 
 ## 12. Roadmap de implementación
 
-| Sprint | Qué |
-|--------|-----|
-| 0 (1 sem) | Crear backend mínimo (Express + Postgres), endpoint `GET /licencia` que devuelve JSON firmado |
-| 1 (2 sem) | TOG Admin → Config → Licencia → botón "Sincronizar" que descarga la licencia |
-| 2 (2 sem) | Stripe Checkout para 1 módulo (Distribuidor). Webhook básico. |
-| 3 (1 sem) | Grace period + emails (Resend). |
-| 4 (2 sem) | Customer Portal link + cambio de tarjeta. |
-| 5 (2 sem) | Panel admin web mínimo (lista de empresas, ver suscripción, revocar). |
+| Sprint | Qué | Estado (2-Sep-2026) |
+|--------|-----|---------------------|
+| 0 | Backend mínimo (Node + SQLite) + endpoint que devuelve la licencia firmada | ✅ hecho (`src/server.js`) |
+| 1 | TOG Admin → Config → Licencia → botón "Sincronizar" que descarga la licencia | ✅ hecho (`license:sync`, pre-auth) |
+| 2 | Stripe Checkout para 1 módulo (Distribuidor) + webhook básico | ✅ implementado — ⏸️ **EN ESPERA** |
+| 3 | Grace period (14 días, configurable) + emails (Resend) | 🟡 grace ✅ / emails ⏳ — EN ESPERA |
+| 4 | Customer Portal link + cambio de tarjeta | ⏳ pendiente — EN ESPERA |
+| 5 | Panel admin web mínimo (lista de empresas, ver suscripción, revocar) | ⏳ pendiente (existe API admin, no UI) — EN ESPERA |
 
-**Total MVP**: ~10 semanas para tener Roberto pagando con tarjeta y recibiendo su módulo automáticamente.
+**Estado real:** ya opera el flujo **manual + Sincronizar** sin servidor público. El cobro online queda **en pausa** hasta que exista un cliente que pague con tarjeta (ver `README.md`).
 
 ---
 

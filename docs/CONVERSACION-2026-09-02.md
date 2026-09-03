@@ -95,8 +95,8 @@ Flujo completo del roadmap (sprint 1) implementado:
 
 - **Stripe en producción**: crear productos/precios en el dashboard, configurar el webhook y probar un pago real de punta a punta. Harness listo: `npm run smoke:stripe` (levanta el backend, crea precio + empresa, muestra el checkout y verifica la activación tras pagar con la tarjeta 4242…). Solo requiere `STRIPE_SECRET_KEY`/`STRIPE_WEBHOOK_SECRET` de prueba.
 - Despliegue del backend (hoy corre local con `node src/server.js`; necesitará HTTPS para el webhook).
-- QA manual en Electron del flujo “Config → Licencia → Sincronizar” contra un backend local (checklist en `docs/QA-SYNC.md`).
-- Pruebas unitarias de handlers del Distribuidor (clientes y pedidos) con DB en memoria — **159 tests tog-admin ✓**.
+- QA manual en Electron del flujo “Config → Licencia → Sincronizar” contra un backend local (checklist en `docs/QA-SYNC.md`) — el flujo automatizado ya pasó; falta solo el click-through en pantalla.
+- ~~Pruebas unitarias de handlers del Distribuidor (clientes y pedidos) con DB en memoria~~ → ✅ hechas (15 tests de handlers; suite tog-admin en **159 ✓**). Ver sección 11.
 
 ## 10. Decisión de alcance (anti-overengineering)
 
@@ -110,3 +110,22 @@ Flujo completo del roadmap (sprint 1) implementado:
 **Criterio para el futuro:** no invertir en más infraestructura de cobro/nube hasta que el flujo manual tenga clientes reales pagando; automatizar solo cuando ese dolor aparezca.
 - Considerar hostname/máquina: la licencia hoy no fija `machineId` cuando se emite desde el backend (null), igual que el flujo manual actual.
 - Portal de gestión de suscripción (Stripe Customer Portal) para que Roberto cancele/actualice su plan.
+
+## 11. Prueba e2e del flujo HOY (operación manual real)
+
+Se ejecutó el flujo de venta manual de punta a punta contra la DB local (`data/tog-platform.db`) y la clave privada real de TOG Admin (`../tog-admin/keys/private.key`):
+
+1. **Alta del primer cliente (demo)** — empresa **#4**: `Primera Papeleria Demo C.A.`, `pais=VE`, `documento=J-DEMO-00001`, **api_key** `7f8e370591b88e668844606a279f9d7b` (`POST /api/empresas`).
+2. **Emisión de licencia** — módulos `["distribuidor"]`, expira `2027-12-31`, firma RSA presente (`POST /api/empresas/4/licencias`).
+3. **Sincronización** — `GET /api/empresas/4/licencia` con la api_key → HTTP 200 con exactamente el JSON que guarda la app al presionar Sincronizar.
+4. **Validación automatizada** — `npx tsx scripts/qa-sync.ts` (en tog-admin): la clave pública embebida es la pareja exacta de la privada y la firma se valida con **la misma función que usa la app** (`verifyLicenseSignature`) → el módulo `distribuidor` quedaría activo en el menú.
+
+Notas: la DB local quedó con 4 empresas (ids 1–3 de pruebas previas + esta demo). El servidor de prueba quedó detenido. Para repetirlo: `cd tog-platform && LICENSE_PRIVATE_KEY_PATH=../tog-admin/keys/private.key npm start`.
+
+## 12. Actualización integral de la documentación (cierre del día)
+
+Tras la prueba HOY se sincronizó toda la documentación viva con el código:
+
+- **tog-admin**: README (features Distribuidor, 159 tests, licencia offline + Sincronizar); `docs/ARCHITECTURE.md` (16 migraciones · 21 tablas, rutas `/clientes` y `/pedidos`, canales `clientes:*`/`pedidos:*`/`license:sync`, servicios `license-crypto.ts`/`license-sync.ts`, 39 permisos, ~1.329 keys i18n); `docs/MODULOS.md` (Distribuidor v1 completo, identidad `pais + documento`, roadmap con checks); `docs/FEATURES.md` (módulo Distribuidor + conteos); `docs/DATA_MODEL.md` (esquema canónico = migraciones 001→016, `proveedores.ein`, apéndice de tablas 010–016); `docs/TECH_STACK.md` (árbol actual); `docs/LICENCIAMIENTO.md` (Opción D — Sincronizar; revocación online); banners “Estado real / EN ESPERA” en los espejos `MODULOS.md`, `ARQUITECTURA-MODULAR.md` y `FACTURACION-STRIPE.md`.
+- **tog-platform**: README (roadmap real; Distribuidor completo; Stripe + webhooks + grace period en una sola fila EN ESPERA); `docs/MODULOS.md`, `docs/FACTURACION-STRIPE.md` y `docs/ARQUITECTURA-MODULAR.md` con estados reales y marca EN ESPERA.
+- **Criterio de mantenimiento**: los documentos de visión/diseño llevan un banner “Estado real (fecha)” para que no se confundan con la implementación; los esquemas canónicos apuntan al código (`tog-admin/src/main/db/database.ts`, `tog-platform/src/schema.sql`).
