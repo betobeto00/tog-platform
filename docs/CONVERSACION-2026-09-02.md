@@ -63,10 +63,31 @@ Flujo completo del roadmap (sprint 1) implementado:
 
 **Commit:** `0050871` — *feat: sincronizar licencia desde TOG Platform (botón en Config y bloqueo)*
 
-## 5. Pendientes / próximos pasos
+## 5. QA del flujo de sincronización
 
-- Stripe: checkout + webhooks (hoy devuelven 501 en el backend).
-- Pedidos del módulo Distribuidor (tablas ya creadas; UI en construcción).
-- Despliegue del backend (hoy corre local con `node src/server.js`).
-- QA manual en Electron del flujo “Config → Licencia → Sincronizar” contra un backend local.
+- Se extrajo la cripto de licencia a un módulo puro (`src/main/services/license-crypto.ts`: clave pública embebida + `verifyLicenseSignature`), con tests unitarios (firma válida, manipulación, clave equivocada).
+- **`scripts/qa-sync.ts`** (tog-admin): levanta el backend real con `keys/private.key`, verifica que la pública embebida es su pareja, crea una empresa internacional, emite licencia con Distribuidor y valida la descarga con la misma función de la app. **Verde.**
+- Pasos manuales en Electron documentados en `docs/QA-SYNC.md`.
+- Commit `caa4971`.
+
+## 6. Pedidos del módulo Distribuidor (CRUD completo)
+
+- Handlers IPC con validación zod, numeración secuencial (`configuracion.pedido_numero`), transiciones de estado validadas (pendiente → despachado/entregado/anulado; despachado → entregado) y catálogo de productos del Core sin requerir permiso de inventario.
+- `PedidosPage` completa (crear con renglones, listar, despachar, entregar, anular) + i18n es/en. Tablas ya existían (migración 015).
+- Commit `b09b833`. **Tests tog-admin: 144 ✓**
+
+## 7. Stripe Checkout MVP en el backend
+
+- Sin SDK: helpers en `src/stripe.js` (REST con `fetch` inyectable + verificación HMAC-SHA256 del webhook), cero dependencias.
+- `POST /api/checkout-session` crea la suscripción con el módulo pedido; el webhook **`checkout.session.completed`** emite una licencia nueva (módulos actuales ∪ comprado) con 1 mes de vigencia, crea la suscripción y registra el evento (idempotente vía `webhook_events`). `customer.subscription.deleted` marca la suscripción cancelada.
+- Sin credenciales Stripe → responde 503 con mensaje claro. Páginas de retorno `/checkout/success|cancel`.
+- Env: `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_DOMAIN`, `STRIPE_PRICE_<MODULO>` (ver `.env.example`).
+- **Tests tog-platform: 18 ✓** (firma HMAC, construcción de sesión, e2e del webhook sin red: activación de módulo, idempotencia, suma de módulos, cancelación).
+
+## 8. Pendientes / próximos pasos
+
+- **Stripe en producción**: crear productos/precios en el dashboard, configurar el webhook y probar un pago real de punta a punta (aún sin `invoice.payment_failed` → grace period de 14 días).
+- Despliegue del backend (hoy corre local con `node src/server.js`; necesitará HTTPS para el webhook).
+- QA manual en Electron del flujo “Config → Licencia → Sincronizar” contra un backend local (checklist en `docs/QA-SYNC.md`).
 - Considerar hostname/máquina: la licencia hoy no fija `machineId` cuando se emite desde el backend (null), igual que el flujo manual actual.
+- Portal de gestión de suscripción (Stripe Customer Portal) para que Roberto cancele/actualice su plan.

@@ -201,14 +201,20 @@ test('emisión manual valida campos y módulos desconocidos', async () => {
   assert.equal(fechaInvalida.status, 400)
 })
 
-test('checkout y webhook de Stripe aún devuelven 501 (pendientes)', async () => {
-  const checkout = await post('/api/checkout-session', { precio: 'mensual' }, {
+test('checkout y webhook devuelven 503 cuando Stripe no está configurado', async () => {
+  const checkout = await post('/api/checkout-session', { modulo: 'distribuidor' }, {
     'x-api-key': empresa.api_key,
   })
-  assert.equal(checkout.status, 501)
+  assert.equal(checkout.status, 503)
+  assert.match(checkout.json.error, /no configurado/i)
+
+  const moduloInvalido = await post('/api/checkout-session', { modulo: 'base' }, {
+    'x-api-key': empresa.api_key,
+  })
+  assert.equal(moduloInvalido.status, 400)
 
   const webhook = await post('/api/webhook/stripe', { tipo: 'checkout.session.completed' })
-  assert.equal(webhook.status, 501)
+  assert.equal(webhook.status, 503)
 })
 
 test('rutas desconocidas devuelven 404', async () => {

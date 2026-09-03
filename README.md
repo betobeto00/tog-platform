@@ -95,7 +95,7 @@ Cuando llegue el momento de la nube, **no hay reescritura**: solo se cambia la i
 | ✅ 1 | Backend de licencias en este repo (SQLite + firma RSA) — ver sección siguiente |
 | ✅ 1 | Sincronización licencia local ↔ backend (canal pre-auth `license:sync` en Config y bloqueo) |
 | ✅ 5 | Módulo Distribuidor MVP en tog-admin (CRUD clientes; pedidos en construcción) |
-| 🟡 2 | Integración Stripe Checkout para módulo Distribuidor |
+| 🟡 2 | Stripe Checkout MVP implementado en el backend — falta QA con claves reales y portal del cliente |
 | 🟡 3 | Webhooks de Stripe + grace period |
 | 🟡 4 | Customer Portal + panel admin web mínimo |
 
@@ -120,7 +120,8 @@ Variables de entorno (ver [`.env.example`](./.env.example)): `PORT`, `ADMIN_API_
 | `GET` | `/api/admin/empresas` | `X-Admin-Key` | Listado de empresas |
 | `POST` | `/api/empresas/:id/licencias` | `X-Admin-Key` | Emisión manual de licencia firmada `{ cliente, expira, modules? }` |
 | `GET` | `/api/empresas/:id/licencia` | `X-Api-Key` | Licencia activa para el botón “Sincronizar” de la app |
-| `POST` | `/api/checkout-session` · `/api/webhook/stripe` | `X-Api-Key` | **Pendiente** (devuelve 501 hasta integrar Stripe) |
+| `POST` | `/api/checkout-session` | `X-Api-Key` | Suscripción de un módulo vía Stripe Checkout (`{ modulo }`). Requiere `STRIPE_SECRET_KEY` + `STRIPE_PRICE_<MODULO>` |
+| `POST` | `/api/webhook/stripe` | firma | Eventos idempotentes: activa la licencia al pagar (`checkout.session.completed`) |
 
 Ver detalle completo en [`docs/MODULOS.md`](./docs/MODULOS.md#7-roadmap-por-m%C3%B3dulo).
 

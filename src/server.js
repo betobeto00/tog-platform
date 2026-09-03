@@ -2,11 +2,26 @@ import http from 'node:http'
 import crypto from 'node:crypto'
 import { pathToFileURL } from 'node:url'
 import { db, getActiveLicense } from './db.js'
-import { signLicense, loadPrivateKey } from './sign.js'
+import { signLicense, loadPrivateKey, MODULE_IDS } from './sign.js'
+import { createCheckoutSession, createStripeCustomer, verifyStripeWebhook } from './stripe.js'
 
 const PORT = Number(process.env.PORT || 3001)
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || 'dev-admin-key'
 const PRIVATE_KEY_PATH = process.env.LICENSE_PRIVATE_KEY_PATH || './keys/private.key'
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || ''
+const STRIPE_DOMAIN = (process.env.STRIPE_DOMAIN || `http://localhost:${PORT}`).replace(/\/+$/, '')
+// Módulos que se pueden comprar por suscripción (el Comercializador es la base)
+const MODULOS_COMPRABLES = MODULE_IDS.filter((m) => m !== 'comercializador')
+
+function priceIdFor(modulo) {
+  return process.env[`STRIPE_PRICE_${String(modulo).toUpperCase()}`] || ''
+}
+
+function plusMonths(baseDate, months) {
+  const d = new Date(baseDate)
+  d.setMonth(d.getMonth() + months)
+  return d.toISOString().split('T')[0]
+}
 
 let privateKey = null
 try {
@@ -30,6 +45,14 @@ function readBody(req) {
         resolve(null)
       }
     })
+  })
+}
+
+function readRawBody(req) {
+  return new Promise((resolve) => {
+    let data = ''
+    req.on('data', (chunk) => (data += chunk))
+    req.on('end', () => resolve(data))
   })
 }
 
@@ -61,6 +84,56 @@ function requireEmpresa(req, res) {
 }
 
 // ---------- rutas ----------
+
+function paginaSimple(title, body) {
+  return `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>${title}</title></head><body style="font-family:sans-serif;max-width:560px;margin:80px auto;text-align:center"><h1>${title}</h1><p>${body}</p></body></html>`
+}
+
+// Procesa checkout.session.completed: activa el módulo comprado emitiendo una
+// licencia nueva (unión de módulos actuales + comprado) con 1 mes de vigencia.
+function procesarCheckout(event) {
+  const session = event?.data?.object || {}
+  const modulo = session?.metadata?.modulo
+  if (!MODULOS_COMPRABLES.includes(modulo)) {
+    throw new Error(`Módulo no comprable en checkout: ${modulo}`)
+  }
+  const empresaId = Number(session?.client_reference_id)
+  const empresa = empresaId
+    ? db.prepare('SELECT * FROM empresas WHERE id = ?').get(empresaId)
+    : db.prepare('SELECT * FROM empresas WHERE stripe_customer_id = ?').get(session?.customer)
+  if (!empresa) throw new Error('Empresa no encontrada para el checkout')
+  if (session?.customer) {
+    db.prepare('UPDATE empresas SET stripe_customer_id = ? WHERE id = ?').run(session.customer, empresa.id)
+  }
+  if (!privateKey) throw new Error('Clave privada no configurada para firmar la licencia')
+
+  const ultima = db
+    .prepare('SELECT modules FROM licencias WHERE empresa_id = ? AND revoked_at IS NULL ORDER BY issued_at DESC LIMIT 1')
+    .get(empresa.id)
+  let modulos = []
+  try {
+    modulos = JSON.parse(ultima?.modules || '[]')
+  } catch {}
+  if (!Array.isArray(modulos)) modulos = []
+  const conjunto = new Set([...modulos, modulo])
+  const ordenados = MODULE_IDS.filter((m) => conjunto.has(m))
+
+  const license = signLicense(privateKey, { cliente: empresa.nombre, expira: plusMonths(new Date(), 1), modules: ordenados })
+  db.prepare(
+    `INSERT INTO licencias
+       (empresa_id, modules, max_usuarios, max_sucursales, issued_at, expires_at, payload_json, emitida_por)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(empresa.id, JSON.stringify(license.modules || []), 1, 1, license.emitida, license.expira, JSON.stringify(license), `stripe:${event.id}`)
+
+  const subId = session?.subscription ? String(session.subscription) : null
+  if (subId) {
+    db.prepare(
+      `INSERT INTO suscripciones (empresa_id, stripe_subscription_id, stripe_price_id, estado)
+       VALUES (?, ?, ?, 'active')
+       ON CONFLICT(stripe_subscription_id) DO UPDATE SET estado = 'active', updated_at = datetime('now')`
+    ).run(empresa.id, subId, priceIdFor(modulo))
+  }
+}
 
 async function handle(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`)
@@ -158,16 +231,117 @@ async function handle(req, res) {
     return json(res, 200, { success: true, licencia: JSON.parse(licencia.payload_json) })
   }
 
-  // POST /api/checkout-session  (api_key) — Stripe pendiente
+  // POST /api/checkout-session  (api_key) — Stripe: suscripción de un módulo
   if (method === 'POST' && path === '/api/checkout-session') {
     const empresa = requireEmpresa(req, res)
     if (!empresa) return
-    return json(res, 501, { success: false, error: 'Checkout con tarjeta pendiente: usar emisión manual (pagos por transferencia/pago móvil)' })
+    const body = await readBody(req)
+    const modulo = body?.modulo
+    if (!MODULOS_COMPRABLES.includes(modulo)) {
+      return json(res, 400, {
+        success: false,
+        error: `Módulo no comprable: ${modulo}. Disponibles: ${MODULOS_COMPRABLES.join(', ')}`,
+      })
+    }
+    const priceId = priceIdFor(modulo)
+    if (!process.env.STRIPE_SECRET_KEY) {
+      return json(res, 503, { success: false, error: 'Stripe no configurado (STRIPE_SECRET_KEY)' })
+    }
+    if (!priceId) {
+      return json(res, 503, {
+        success: false,
+        error: `No hay precio de Stripe configurado para el módulo ${modulo} (STRIPE_PRICE_${String(modulo).toUpperCase()})`,
+      })
+    }
+    try {
+      let customerId = empresa.stripe_customer_id
+      if (!customerId) {
+        const customer = await createStripeCustomer({
+          secretKey: process.env.STRIPE_SECRET_KEY,
+          email: empresa.email_contacto,
+          name: empresa.nombre,
+        })
+        customerId = customer.id
+        db.prepare('UPDATE empresas SET stripe_customer_id = ? WHERE id = ?').run(customerId, empresa.id)
+      }
+      const session = await createCheckoutSession({
+        secretKey: process.env.STRIPE_SECRET_KEY,
+        priceId,
+        customer: customerId,
+        clientReferenceId: empresa.id,
+        metadata: { modulo },
+        successUrl: `${STRIPE_DOMAIN}/checkout/success?empresa=${empresa.id}&modulo=${encodeURIComponent(modulo)}`,
+        cancelUrl: `${STRIPE_DOMAIN}/checkout/cancel`,
+      })
+      return json(res, 201, { success: true, url: session.url })
+    } catch (err) {
+      return json(res, 502, { success: false, error: err.message })
+    }
   }
 
-  // POST /api/webhook/stripe — pendiente (verificación de firma al activarse)
+  // GET /checkout/success|cancel — página de retorno del checkout
+  if (method === 'GET' && path.startsWith('/checkout/')) {
+    const exito = path.includes('success')
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+    res.end(
+      exito
+        ? paginaSimple('✅ Pago exitoso', 'Tu módulo quedó activado. Vuelve a TOG Admin y presiona “Sincronizar” en Config → Licencia.')
+        : paginaSimple('Pago cancelado', 'Puedes reintentar el pago cuando quieras. No se te cobró nada.'),
+    )
+    return
+  }
+
+  // POST /api/webhook/stripe — eventos idempotentes (webhook_events por stripe_event_id)
   if (method === 'POST' && path === '/api/webhook/stripe') {
-    return json(res, 501, { success: false, error: 'Webhook de Stripe pendiente de configuración' })
+    if (!STRIPE_WEBHOOK_SECRET || !process.env.STRIPE_SECRET_KEY) {
+      return json(res, 503, {
+        success: false,
+        error: 'Webhook de Stripe no configurado (STRIPE_WEBHOOK_SECRET/STRIPE_SECRET_KEY)',
+      })
+    }
+    const raw = await readRawBody(req)
+    try {
+      verifyStripeWebhook({ secret: STRIPE_WEBHOOK_SECRET, rawBody: raw, signatureHeader: req.headers['stripe-signature'] })
+    } catch (err) {
+      return json(res, 400, { success: false, error: err.message })
+    }
+    let event
+    try {
+      event = JSON.parse(raw)
+    } catch {
+      return json(res, 400, { success: false, error: 'Payload del webhook no es JSON válido' })
+    }
+
+    let resultado
+    try {
+      db.exec('BEGIN')
+      const yaProcesado = db.prepare('SELECT 1 FROM webhook_events WHERE stripe_event_id = ?').get(event.id)
+      if (yaProcesado) {
+        resultado = { duplicado: true }
+      } else {
+        if (event.type === 'checkout.session.completed') {
+          procesarCheckout(event)
+        } else if (event.type === 'customer.subscription.deleted') {
+          const sub = event?.data?.object
+          if (sub?.id) {
+            db.prepare("UPDATE suscripciones SET estado = 'cancelado', cancel_at_period_end = 1 WHERE stripe_subscription_id = ?").run(String(sub.id))
+          }
+        }
+        // invoice.*, customer.subscription.updated, etc.: se registran y se ignoran en el MVP
+        db.prepare('INSERT INTO webhook_events (stripe_event_id, tipo, payload) VALUES (?, ?, ?)').run(event.id, event.type, JSON.stringify(event))
+        resultado = { duplicado: false }
+      }
+      db.exec('COMMIT')
+      return json(res, 200, { received: true, ...resultado })
+    } catch (err) {
+      try {
+        db.exec('ROLLBACK')
+      } catch {
+        // sin transacción activa
+      }
+      console.error('[webhook] error procesando evento', event?.type, err.message)
+      return json(res, 500, { success: false, error: err.message })
+    }
   }
 
   return json(res, 404, { success: false, error: 'Ruta no encontrada' })
