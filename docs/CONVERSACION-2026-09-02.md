@@ -1,0 +1,72 @@
+# Bitácora de Conversación — 2026-09-02
+
+> Continuación de [`CONVERSACION-2025-09-01.md`](./CONVERSACION-2025-09-01.md). Resumen de la sesión: cierre del módulo Distribuidor en TOG Admin, verificación del backend de licencias, internacionalización de la identidad de empresa y sincronización de licencia desde la app.
+
+---
+
+## 0. Contexto de arranque
+
+Los tres repos son **hermanos** bajo `/omnimargen` (cada uno es su propio repo Git):
+
+```
+/omnimargen/landing-page   ← marketing OmniMargen (limpio, sin cambios)
+/omnimargen/tog-admin      ← código del producto (branch fix/license-modularization)
+/omnimargen/tog-platform   ← visión + backend de licencias
+```
+
+## 1. Módulo Distribuidor (tog-admin) — terminado y commiteado
+
+Se cerró el WIP del módulo Distribuidor iniciado en la sesión anterior:
+
+- Migración `015_distribuidor`: tablas `clientes`, `pedidos`, `pedido_detalles`, `remitos`, `listas_precio` (+ índices).
+- Handlers IPC por dominio en `src/main/modules/distribuidor/` (CRUD de clientes con `checkPermissionOrFail` + validación zod + gate por módulo activo de la licencia).
+- Permisos nuevos (`distribuidor_clientes_view/edit`, `distribuidor_pedidos_view/edit`), categoría **Distribuidor** en `permissions.ts`, `PermissionsModal` y tests.
+- UI: rutas `/clientes` y `/pedidos`, entrada en Sidebar con gating por módulo activo (`useActiveModules`), `ClientesPage` (CRUD completo) y `PedidosPage` (placeholder “en construcción”), i18n es/en sin textos hardcodeados.
+- Pruebas nuevas para permisos, validaciones (`clienteCreateSchema`) y normalización de módulos. **`npm run typecheck:all` y `npm test` en verde.**
+
+**Commit:** `e14e7e0` — *feat(distribuidor): add Distributor module with clientes CRUD, license gating and i18n*
+
+## 2. Backend de licencias (tog-platform) — verificado
+
+- `server.js` ahora exporta `startServer({ port })` (arranque directo con guard de `import.meta.url`) → testeable sin escuchar al importar.
+- `db.js` exporta `closeDatabase()` y activa `busy_timeout`.
+- Suite de integración **`node:test` sin dependencias** (`npm test`): salud, auth, alta de empresa, emisión manual con verificación RSA real, consulta de la empresa, validaciones, 501 de Stripe.
+- Smoke end-to-end manual contra la clave privada real de TOG Admin: empresa internacional + licencia firmada + descarga vía api_key.
+
+**Commit:** `1dd8f75` — *feat: backend de licencias verificable con tests de integración*
+
+## 3. Decisión de producto: mercado internacional
+
+**Requerimiento del usuario:** el mercado no es solo Venezuela. Cualquiera puede descargar el software, contactar por WhatsApp, pagar y recibir licencia desde el exterior. Por lo tanto **la identificación de la empresa no puede ser solo el RIF**: debe ser un documento de registro/tributario con convención internacional.
+
+**Decisión implementada:**
+
+- La empresa se identifica por **`pais` (ISO 3166-1 alpha-2, default `VE`) + `documento`** libre: RIF (VE), EIN (US), RFC (MX), NIT (CO), CUIT (AR), CNPJ (BR), VAT (UE)…
+- Unicidad por **`(pais, documento)`**: el mismo número en países distintos son empresas distintas; duplicados solo dentro del mismo país.
+- Canonicalización: `pais` y `documento` en mayúsculas.
+- API: `POST /api/empresas` acepta `nombre`, `pais` (opcional), `documento`, `email_contacto`. `GET /api/admin/empresas` devuelve `pais`/`documento`.
+- Mismo criterio aplicado al registro de clientes del módulo Distribuidor en la app: `clientes.rif` → `clientes.documento` (migración `016_clientes_documento`), etiquetas e i18n neutrales.
+
+**Commits:** `4b9ad53` (backend), `756d861` (clientes de la app)
+
+## 4. Sincronizar licencia desde TOG Admin ↔ TOG Platform
+
+Flujo completo del roadmap (sprint 1) implementado:
+
+1. Canal IPC **pre-auth** `license:sync` (funciona desde la pantalla de bloqueo, sin sesión).
+2. Servicio puro `src/main/services/license-sync.ts` (fetch + guardado inyectados) con timeout de 10 s, mensajes claros y validación de entrada; la licencia descargada pasa por la validación RSA local antes de guardarse (`saveLicense`).
+3. UI reutilizable `LicenseSyncForm` (URL del servidor + ID de empresa + API Key, recordadas en localStorage) integrada en **Config → Licencia** y en la pantalla de **LicenseGate**.
+4. Evento `tog:license-updated` → el Sidebar/`useActiveModules` refresca los módulos en vivo tras sincronizar o importar.
+5. `license:sync` se agregó a `PREAUTH_CHANNELS` (en `ipc-channels.ts` **y** en el espejo `api-client.ts`) + tests del servicio (éxito, errores HTTP, red caída, timeout, validación, guardado rechazado).
+
+**Tests:** tog-admin 136 ✓ · tog-platform 9 ✓.
+
+**Commit:** `0050871` — *feat: sincronizar licencia desde TOG Platform (botón en Config y bloqueo)*
+
+## 5. Pendientes / próximos pasos
+
+- Stripe: checkout + webhooks (hoy devuelven 501 en el backend).
+- Pedidos del módulo Distribuidor (tablas ya creadas; UI en construcción).
+- Despliegue del backend (hoy corre local con `node src/server.js`).
+- QA manual en Electron del flujo “Config → Licencia → Sincronizar” contra un backend local.
+- Considerar hostname/máquina: la licencia hoy no fija `machineId` cuando se emite desde el backend (null), igual que el flujo manual actual.

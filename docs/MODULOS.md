@@ -25,7 +25,7 @@ La visión de **TOG Platform** es que cada eslabón sea un **módulo activable p
 | 1 | **Productor** | 🟡 Diseño | Siembra, costos de campo, estimación de cosecha, logística de acopio | Core |
 | 2 | **Procesador** | 🟡 Diseño | Recepción de materia prima, recetas/BOM, transformación, mermas, lote de salida | Core + Productor (opcional) |
 | 3 | **Comercializador** | ✅ Parcial (`tog-admin`) | Inventario, compras, ventas, cotizaciones, caja, POS | Core |
-| 4 | **Distribuidor** | 🟡 Diseño | Clientes, rutas, flotas, pedidos, remitos, despachos, listas de precio, crédito | Core + Comercializador |
+| 4 | **Distribuidor** | ✅ MVP — CRUD de clientes (`tog-admin`, 2026-09); pedidos en construcción | Clientes (con documento de registro internacional), pedidos, remitos, listas de precio, crédito. Rutas, flotas y despachos pendientes | Core + Comercializador |
 | 5 | **Postventa** | 🟡 Diseño | Tickets de soporte, devoluciones, garantías, notas de crédito | Core + Comercializador |
 
 **Leyenda**: ✅ existe · 🟡 en diseño · ⚪ no iniciado
@@ -43,7 +43,8 @@ Una licencia es un JSON firmado RSA (la clave pública ya está embebida en `lic
 ```json
 {
   "empresa": "AgroMaíz C.A.",
-  "rif": "J-12345678-9",
+  "pais": "VE",
+  "documento": "J-12345678-9",
   "issued_at": "2025-01-15",
   "expires_at": "2026-01-15",
   "modules": ["core", "comercializador", "distribuidor"],

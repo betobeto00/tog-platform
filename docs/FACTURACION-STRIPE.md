@@ -56,14 +56,18 @@
 ## 3. Modelo de datos del backend
 
 ```sql
--- Empresas clientes
+-- Empresas clientes. Mercado internacional: la empresa se identifica por
+-- pais (ISO 3166-1 alpha-2) + documento de registro/tributario libre
+-- (RIF, EIN, RFC, NIT, CUIT, CNPJ, VAT…). Duplicados solo dentro del mismo pais.
 CREATE TABLE empresas (
   id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   nombre          TEXT NOT NULL,
-  rif             TEXT UNIQUE NOT NULL,
+  pais            TEXT NOT NULL DEFAULT 'VE',
+  documento       TEXT NOT NULL,
   email_contacto  TEXT NOT NULL,
   stripe_customer_id TEXT UNIQUE,
-  created_at      TIMESTAMPTZ DEFAULT NOW()
+  created_at      TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (pais, documento)
 );
 
 -- Licencias emitidas (historial completo, no solo la actual)
@@ -266,7 +270,7 @@ export function verifyLicense(licenseString: string): LicensePayload | null {
 | Riesgo | Mitigación |
 |--------|-----------|
 | `STRIPE_SECRET_KEY` se filtra | Variables de entorno, nunca en código. Rotar si se filtra. |
-| Licencia firmada es interceptada y reusada | La licencia lleva `empresa.rif` + (opcional) fingerprint del PC. Si dos PCs distintos usan la misma licencia con la misma `rif`, válido. Si PCs distintos de empresas distintas, fraude. |
+| Licencia firmada es interceptada y reusada | La licencia lleva `empresa.documento` (más `empresa.pais`) + (opcional) fingerprint del PC. Si dos PCs distintos usan la misma licencia con el mismo `(pais, documento)`, válido. Si PCs distintos de empresas distintas, fraude. |
 | Cliente modifica el `.exe` para bypassear validación | `license.ts` ya tiene anti-tampering básico. Mejorar con checksums firmados del binario. No es perfecto, pero sube el costo. |
 | Cliente paga y no recibe licencia | Webhook → DB → API idempotente. Si pasa >5 min y no se actualizó, "Sincronizar" fuerza pull. |
 | Cliente no paga pero sigue usando | Backend revoca, próxima vez que la app sincroniza (o cada N días) la licencia cae. Sin internet, el cliente puede seguir indefinidamente offline — es el costo de ser offline-first. Mitigable con check-in obligatorio cada 30 días. |
