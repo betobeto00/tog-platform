@@ -95,9 +95,29 @@ Cuando llegue el momento de la nube, **no hay reescritura**: solo se cambia la i
 | ✅ 1 | Backend de licencias en este repo (SQLite + firma RSA) — ver sección siguiente |
 | ✅ 1 | Sincronización licencia local ↔ backend (canal pre-auth `license:sync` en Config y bloqueo) |
 | ✅ 5 | Módulo Distribuidor MVP en tog-admin (CRUD clientes; pedidos en construcción) |
-| 🟡 2 | Stripe Checkout MVP implementado en el backend — falta QA con claves reales y portal del cliente |
+| ⏸️ 2 | Stripe Checkout MVP **en espera**: implementado y testeado, pero no se avanza hasta que un cliente quiera pagar online |
 | 🟡 3 | Webhooks de Stripe + grace period |
 | 🟡 4 | Customer Portal + panel admin web mínimo |
+
+## Qué es HOY (flujo manual) y qué está EN ESPERA
+
+> Decisión de alcance (anti-overengineering): no construir infraestructura
+> especulativa. El código de Stripe/nube queda commiteado y testeado, pero **en
+> pausa** hasta que exista un cliente que quiera pagar online.
+
+**Hoy — operar con un cliente (sin servidor público, sin Stripe, sin HTTPS):**
+
+1. El cliente te contacta (WhatsApp/email) y paga por transferencia o pago móvil.
+2. Tú das de alta su empresa: `POST /api/empresas` (`{ nombre, pais, documento, email_contacto }`).
+3. Emites su licencia: `POST /api/empresas/:id/licencias` (`{ cliente, expira, modules }`).
+4. El cliente abre TOG Admin → **Config → Licencia → Sincronizar** (URL + ID de empresa + API Key), o importa el archivo `.key`.
+5. Verificación: `npx tsx scripts/qa-sync.ts` (tog-admin) y checklist en `docs/QA-SYNC.md`.
+
+**En espera — hasta que alguien quiera pagar con tarjeta online:**
+
+- Stripe Checkout + webhooks + grace period (implementado y testeado en `src/`).
+- Requiere decisión de modelo de cobro (suscripción mensual vs. pago único), despliegue del backend con HTTPS y productos/precios reales en Stripe.
+- Harness de prueba real: `npm run smoke:stripe` (solo con claves de modo test).
 
 ## Backend de licencias (implementación en este repo)
 

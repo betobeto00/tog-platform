@@ -97,5 +97,16 @@ Flujo completo del roadmap (sprint 1) implementado:
 - Despliegue del backend (hoy corre local con `node src/server.js`; necesitará HTTPS para el webhook).
 - QA manual en Electron del flujo “Config → Licencia → Sincronizar” contra un backend local (checklist en `docs/QA-SYNC.md`).
 - Pruebas unitarias de handlers del Distribuidor (clientes y pedidos) con DB en memoria — **159 tests tog-admin ✓**.
+
+## 10. Decisión de alcance (anti-overengineering)
+
+**Preocupación del usuario:** miedo al overengineering tras construir el bloque de Stripe (checkout + webhooks + grace period + smoke), que es la parte más pesada y **no tiene aún un cliente que pague online**.
+
+**Decisión (elegida por el usuario):** no tocar código — el bloque queda commiteado y testeado — pero **marcar prioridades en docs**:
+
+1. **Flujo HOY (v1, manual):** WhatsApp/transferencia → `POST /api/empresas` + emisión manual de licencia → el cliente **Sincroniza** (o importa `.key`). Sin servidor público, sin Stripe, sin HTTPS. Ver sección “Qué es HOY… y qué está EN ESPERA” en el README.
+2. **En espera:** Stripe Checkout + webhooks + grace period + harness `smoke:stripe`. Implementado y probado (19 tests), pero **en pausa** hasta que exista un cliente que pague online; requiere definir el modelo de cobro (suscripción vs. pago único) y desplegar con HTTPS.
+
+**Criterio para el futuro:** no invertir en más infraestructura de cobro/nube hasta que el flujo manual tenga clientes reales pagando; automatizar solo cuando ese dolor aparezca.
 - Considerar hostname/máquina: la licencia hoy no fija `machineId` cuando se emite desde el backend (null), igual que el flujo manual actual.
 - Portal de gestión de suscripción (Stripe Customer Portal) para que Roberto cancele/actualice su plan.
