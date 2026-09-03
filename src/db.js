@@ -20,6 +20,15 @@ db.exec(`
 const schema = readFileSync(join(__dirname, 'schema.sql'), 'utf8')
 db.exec(schema)
 
+// Columnas agregadas después del primer despliegue (CREATE TABLE IF NOT EXISTS
+// no modifica tablas existentes): suscripciones.failed_at / grace_ends_at
+const colsSuscripciones = db.prepare('PRAGMA table_info(suscripciones)').all().map((c) => c.name)
+for (const columna of ['failed_at', 'grace_ends_at']) {
+  if (!colsSuscripciones.includes(columna)) {
+    db.exec(`ALTER TABLE suscripciones ADD COLUMN ${columna} TEXT`)
+  }
+}
+
 export function closeDatabase() {
   try {
     db.close()

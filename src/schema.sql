@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS suscripciones (
   estado                 TEXT NOT NULL DEFAULT 'active',
   current_period_end     TEXT,
   cancel_at_period_end   INTEGER NOT NULL DEFAULT 0,
+  -- Grace period por impago: estado 'impago' + fecha límite (14 días);
+  -- al vencer sin pago la suscripción pasa a 'cancelado_impago' y se revoca la licencia.
+  failed_at              TEXT,
+  grace_ends_at          TEXT,
   created_at             TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at             TEXT NOT NULL DEFAULT (datetime('now'))
 );

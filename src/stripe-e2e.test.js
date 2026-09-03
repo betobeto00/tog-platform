@@ -172,3 +172,65 @@ test('customer.subscription.deleted marca la suscripción como cancelada', async
   const sub = db.prepare("SELECT estado FROM suscripciones WHERE stripe_subscription_id = 'sub_global_1'").get()
   assert.equal(sub.estado, 'cancelado')
 })
+
+test('grace period: pago fallido → impago, vencido → revoca (402), pago ok → reactiva', async () => {
+  const { db } = await import('./db.js')
+
+  // Empresa nueva (CO) para no interferir con los escenarios anteriores
+  const creada = await fetch(base + '/api/empresas', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-admin-key': 'stripe-admin-key' },
+    body: JSON.stringify({ nombre: 'Granos Andinos SAS', pais: 'CO', documento: 'NIT-900000000-1', email_contacto: 'info@granos.co' }),
+  })
+  assert.equal(creada.status, 201)
+  const empB = await creada.json()
+
+  // Compra inicial (módulo distribuidor)
+  const compra = await enviarWebhook({
+    id: 'evt_grace_1',
+    type: 'checkout.session.completed',
+    data: { object: { id: 'cs_grace_1', client_reference_id: String(empB.id), customer: 'cus_grace', subscription: 'sub_grace_1', metadata: { modulo: 'distribuidor' } } },
+  })
+  assert.equal(compra.status, 200)
+
+  // 1. La factura falla → estado impago con grace period de 14 días
+  const fallo = await enviarWebhook({
+    id: 'evt_grace_2',
+    type: 'invoice.payment_failed',
+    data: { object: { id: 'in_grace_2', subscription: 'sub_grace_1' } },
+  })
+  assert.equal(fallo.status, 200)
+  const impaga = db.prepare("SELECT * FROM suscripciones WHERE stripe_subscription_id = 'sub_grace_1'").get()
+  assert.equal(impaga.estado, 'impago')
+  const hoy = new Date().toISOString().split('T')[0]
+  assert.ok(impaga.grace_ends_at >= hoy && impaga.grace_ends_at > hoy, 'debe tener fecha de gracia futura')
+
+  // 2. Durante el grace period la licencia sigue sirviéndose (offline-first)
+  const enGracia = await fetch(base + `/api/empresas/${empB.id}/licencia`, { headers: { 'x-api-key': empB.api_key } })
+  assert.equal(enGracia.status, 200)
+
+  // 3. Se vence el grace period → revocación y 402 al sincronizar
+  const ayer = new Date(Date.now() - 2 * 86400000).toISOString().split('T')[0]
+  db.prepare("UPDATE suscripciones SET grace_ends_at = ? WHERE stripe_subscription_id = 'sub_grace_1'").run(ayer)
+  const bloqueada = await fetch(base + `/api/empresas/${empB.id}/licencia`, { headers: { 'x-api-key': empB.api_key } })
+  assert.equal(bloqueada.status, 402)
+  const subRev = db.prepare("SELECT estado FROM suscripciones WHERE stripe_subscription_id = 'sub_grace_1'").get()
+  assert.equal(subRev.estado, 'cancelado_impago')
+  const revocada = db.prepare('SELECT revoked_at, motivo_revocado FROM licencias WHERE empresa_id = ? AND revoked_at IS NOT NULL').get(empB.id)
+  assert.ok(revocada, 'la licencia debe quedar revocada')
+  assert.equal(revocada.motivo_revocado, 'impago:grace-period')
+
+  // 4. El cliente paga → reactivación: suscripción activa y licencia nueva
+  const pagado = await enviarWebhook({
+    id: 'evt_grace_3',
+    type: 'invoice.payment_succeeded',
+    data: { object: { id: 'in_grace_3', subscription: 'sub_grace_1' } },
+  })
+  assert.equal(pagado.status, 200)
+  const subActiva = db.prepare("SELECT estado FROM suscripciones WHERE stripe_subscription_id = 'sub_grace_1'").get()
+  assert.equal(subActiva.estado, 'active')
+  const activa = await fetch(base + `/api/empresas/${empB.id}/licencia`, { headers: { 'x-api-key': empB.api_key } })
+  assert.equal(activa.status, 200)
+  const { licencia } = await activa.json()
+  assert.ok((licencia.modules || []).includes('distribuidor'), 'la licencia reactivada conserva el módulo')
+})

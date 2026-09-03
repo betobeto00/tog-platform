@@ -84,10 +84,18 @@ Flujo completo del roadmap (sprint 1) implementado:
 - Env: `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_DOMAIN`, `STRIPE_PRICE_<MODULO>` (ver `.env.example`).
 - **Tests tog-platform: 18 ✓** (firma HMAC, construcción de sesión, e2e del webhook sin red: activación de módulo, idempotencia, suma de módulos, cancelación).
 
-## 8. Pendientes / próximos pasos
+## 8. Grace period de 14 días por impago
 
-- **Stripe en producción**: crear productos/precios en el dashboard, configurar el webhook y probar un pago real de punta a punta (aún sin `invoice.payment_failed` → grace period de 14 días).
+- `invoice.payment_failed` → suscripción **`impago`** con `grace_ends_at = +14 días` (`LICENSE_GRACE_DAYS` configurable). Durante la gracia la licencia sigue sirviéndose (offline-first).
+- Al vencer sin pago (barrido perezoso antes de servir licencias y en cada webhook): suscripción **`cancelado_impago`** y **revocación** de la licencia (`revoked_at` + motivo). El sync de la app recibe **402** con mensaje claro.
+- `invoice.payment_succeeded` → suscripción `active` y **re-emisión** de la licencia (módulos acumulados + 1 mes): renueva el ciclo mensual y reactiva tras impago.
+- Test e2e completo de la vida del grace period. **Tests tog-platform: 19 ✓**
+
+## 9. Pendientes / próximos pasos
+
+- **Stripe en producción**: crear productos/precios en el dashboard, configurar el webhook y probar un pago real de punta a punta (harness en `scripts/stripe-smoke.mjs`).
 - Despliegue del backend (hoy corre local con `node src/server.js`; necesitará HTTPS para el webhook).
 - QA manual en Electron del flujo “Config → Licencia → Sincronizar” contra un backend local (checklist en `docs/QA-SYNC.md`).
+- Pruebas unitarias de handlers del Distribuidor (clientes y pedidos) con DB en memoria — **159 tests tog-admin ✓**.
 - Considerar hostname/máquina: la licencia hoy no fija `machineId` cuando se emite desde el backend (null), igual que el flujo manual actual.
 - Portal de gestión de suscripción (Stripe Customer Portal) para que Roberto cancele/actualice su plan.

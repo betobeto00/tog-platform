@@ -23,6 +23,15 @@ function plusMonths(baseDate, months) {
   return d.toISOString().split('T')[0]
 }
 
+function plusDays(baseDate, days) {
+  const d = new Date(baseDate)
+  d.setDate(d.getDate() + days)
+  return d.toISOString().split('T')[0]
+}
+
+// Días de gracia por impago antes de revocar la licencia (modo lectura offline)
+const GRACE_DAYS = Number(process.env.LICENSE_GRACE_DAYS || 14)
+
 let privateKey = null
 try {
   privateKey = loadPrivateKey(PRIVATE_KEY_PATH)
@@ -89,8 +98,71 @@ function paginaSimple(title, body) {
   return `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>${title}</title></head><body style="font-family:sans-serif;max-width:560px;margin:80px auto;text-align:center"><h1>${title}</h1><p>${body}</p></body></html>`
 }
 
+// Módulos de la licencia más reciente (aunque esté revocada) para preservar
+// las compras acumuladas al re-emitir.
+function modulosDeUltimaLicencia(empresaId) {
+  const ultima = db
+    .prepare('SELECT modules FROM licencias WHERE empresa_id = ? ORDER BY issued_at DESC, id DESC LIMIT 1')
+    .get(empresaId)
+  let modulos = []
+  try {
+    modulos = JSON.parse(ultima?.modules || '[]')
+  } catch {}
+  return Array.isArray(modulos) ? modulos : []
+}
+
+function moduloDePriceId(priceId) {
+  return MODULOS_COMPRABLES.find((m) => priceIdFor(m) === priceId) || null
+}
+
+// Emite (o renueva) la licencia de una empresa sumando/renovando un módulo.
+function emitirLicencia(empresa, { modulo, por, meses = 1 }) {
+  if (!privateKey) throw new Error('Clave privada no configurada para firmar la licencia')
+  const conjunto = new Set([...modulosDeUltimaLicencia(empresa.id), modulo])
+  const ordenados = MODULE_IDS.filter((m) => conjunto.has(m))
+  const license = signLicense(privateKey, {
+    cliente: empresa.nombre,
+    expira: plusMonths(new Date(), meses),
+    modules: ordenados,
+  })
+  db.prepare(
+    `INSERT INTO licencias
+       (empresa_id, modules, max_usuarios, max_sucursales, issued_at, expires_at, payload_json, emitida_por)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(empresa.id, JSON.stringify(license.modules || []), 1, 1, license.emitida, license.expira, JSON.stringify(license), por)
+  return license
+}
+
+// Grace period vencido sin pago → 'cancelado_impago' y revocación de la licencia.
+// Se ejecuta antes de servir una licencia (y en cada webhook) para no depender
+// de un cron.
+function revocarImpagosVencidos() {
+  const hoy = new Date().toISOString().split('T')[0]
+  const vencidas = db
+    .prepare("SELECT id, empresa_id FROM suscripciones WHERE estado = 'impago' AND grace_ends_at IS NOT NULL AND grace_ends_at < ?")
+    .all(hoy)
+  if (!vencidas.length) return
+  db.exec('BEGIN')
+  try {
+    for (const s of vencidas) {
+      db.prepare("UPDATE suscripciones SET estado = 'cancelado_impago', updated_at = datetime('now') WHERE id = ?").run(s.id)
+      db.prepare(
+        "UPDATE licencias SET revoked_at = datetime('now'), motivo_revocado = 'impago:grace-period' WHERE empresa_id = ? AND revoked_at IS NULL"
+      ).run(s.empresa_id)
+    }
+    db.exec('COMMIT')
+  } catch (err) {
+    try {
+      db.exec('ROLLBACK')
+    } catch {
+      // sin transacción activa
+    }
+    throw err
+  }
+}
+
 // Procesa checkout.session.completed: activa el módulo comprado emitiendo una
-// licencia nueva (unión de módulos actuales + comprado) con 1 mes de vigencia.
+// licencia nueva (módulos acumulados + comprado) con 1 mes de vigencia.
 function procesarCheckout(event) {
   const session = event?.data?.object || {}
   const modulo = session?.metadata?.modulo
@@ -105,32 +177,14 @@ function procesarCheckout(event) {
   if (session?.customer) {
     db.prepare('UPDATE empresas SET stripe_customer_id = ? WHERE id = ?').run(session.customer, empresa.id)
   }
-  if (!privateKey) throw new Error('Clave privada no configurada para firmar la licencia')
-
-  const ultima = db
-    .prepare('SELECT modules FROM licencias WHERE empresa_id = ? AND revoked_at IS NULL ORDER BY issued_at DESC LIMIT 1')
-    .get(empresa.id)
-  let modulos = []
-  try {
-    modulos = JSON.parse(ultima?.modules || '[]')
-  } catch {}
-  if (!Array.isArray(modulos)) modulos = []
-  const conjunto = new Set([...modulos, modulo])
-  const ordenados = MODULE_IDS.filter((m) => conjunto.has(m))
-
-  const license = signLicense(privateKey, { cliente: empresa.nombre, expira: plusMonths(new Date(), 1), modules: ordenados })
-  db.prepare(
-    `INSERT INTO licencias
-       (empresa_id, modules, max_usuarios, max_sucursales, issued_at, expires_at, payload_json, emitida_por)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(empresa.id, JSON.stringify(license.modules || []), 1, 1, license.emitida, license.expira, JSON.stringify(license), `stripe:${event.id}`)
+  emitirLicencia(empresa, { modulo, por: `stripe:${event.id}` })
 
   const subId = session?.subscription ? String(session.subscription) : null
   if (subId) {
     db.prepare(
-      `INSERT INTO suscripciones (empresa_id, stripe_subscription_id, stripe_price_id, estado)
-       VALUES (?, ?, ?, 'active')
-       ON CONFLICT(stripe_subscription_id) DO UPDATE SET estado = 'active', updated_at = datetime('now')`
+      `INSERT INTO suscripciones (empresa_id, stripe_subscription_id, stripe_price_id, estado, failed_at, grace_ends_at)
+       VALUES (?, ?, ?, 'active', NULL, NULL)
+       ON CONFLICT(stripe_subscription_id) DO UPDATE SET estado = 'active', failed_at = NULL, grace_ends_at = NULL, updated_at = datetime('now')`
     ).run(empresa.id, subId, priceIdFor(modulo))
   }
 }
@@ -226,8 +280,22 @@ async function handle(req, res) {
   if (method === 'GET' && licenciaMatch) {
     const empresa = requireEmpresa(req, res)
     if (!empresa) return
+    try {
+      revocarImpagosVencidos()
+    } catch (err) {
+      console.error('[licencia] error al barrer impagos vencidos', err.message)
+    }
     const licencia = getActiveLicense(empresa.id)
-    if (!licencia) return json(res, 404, { success: false, error: 'Sin licencia activa' })
+    if (!licencia) {
+      const sub = db.prepare('SELECT estado FROM suscripciones WHERE empresa_id = ? ORDER BY id DESC LIMIT 1').get(empresa.id)
+      if (sub?.estado === 'cancelado_impago') {
+        return json(res, 402, {
+          success: false,
+          error: 'Suscripción cancelada por falta de pago. Reactívala (Stripe o manual) para volver a sincronizar los módulos.',
+        })
+      }
+      return json(res, 404, { success: false, error: 'Sin licencia activa' })
+    }
     return json(res, 200, { success: true, licencia: JSON.parse(licencia.payload_json) })
   }
 
@@ -326,8 +394,36 @@ async function handle(req, res) {
           if (sub?.id) {
             db.prepare("UPDATE suscripciones SET estado = 'cancelado', cancel_at_period_end = 1 WHERE stripe_subscription_id = ?").run(String(sub.id))
           }
+        } else if (event.type === 'invoice.payment_failed') {
+          const invoice = event?.data?.object
+          const subId = invoice?.subscription ? String(invoice.subscription) : null
+          if (subId) {
+            // Entra en grace period: la licencia sigue sirviéndose hasta grace_ends_at
+            db.prepare(
+              "UPDATE suscripciones SET estado = 'impago', failed_at = datetime('now'), grace_ends_at = ?, updated_at = datetime('now') WHERE stripe_subscription_id = ?"
+            ).run(plusDays(new Date(), GRACE_DAYS), subId)
+          }
+        } else if (event.type === 'invoice.payment_succeeded') {
+          const invoice = event?.data?.object
+          const subId = invoice?.subscription ? String(invoice.subscription) : null
+          if (subId) {
+            const sub = db
+              .prepare('SELECT empresa_id, stripe_price_id FROM suscripciones WHERE stripe_subscription_id = ?')
+              .get(subId)
+            if (sub) {
+              db.prepare(
+                "UPDATE suscripciones SET estado = 'active', failed_at = NULL, grace_ends_at = NULL, cancel_at_period_end = 0, updated_at = datetime('now') WHERE stripe_subscription_id = ?"
+              ).run(subId)
+              const empresa = db.prepare('SELECT * FROM empresas WHERE id = ?').get(sub.empresa_id)
+              const modulo = moduloDePriceId(sub.stripe_price_id)
+              if (empresa && modulo) {
+                // Renovación mensual: re-emite la licencia (módulos acumulados + 1 mes)
+                emitirLicencia(empresa, { modulo, por: `stripe:${event.id}` })
+              }
+            }
+          }
         }
-        // invoice.*, customer.subscription.updated, etc.: se registran y se ignoran en el MVP
+        // customer.subscription.updated y otros eventos: se registran y se ignoran en el MVP
         db.prepare('INSERT INTO webhook_events (stripe_event_id, tipo, payload) VALUES (?, ?, ?)').run(event.id, event.type, JSON.stringify(event))
         resultado = { duplicado: false }
       }
