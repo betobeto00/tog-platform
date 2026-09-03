@@ -107,6 +107,7 @@ El repo ya **no es solo documentación**: también contiene el backend MVP (Node
 npm start          # servidor en http://localhost:3001 (requiere la clave privada: LICENSE_PRIVATE_KEY_PATH)
 npm test           # suite de integración (node:test)
 npm run test:sign  # autotest de firma RSA
+npm run smoke:stripe  # pago real en modo test de Stripe (requiere sk_test_/whsec_ + tarjeta 4242)
 ```
 
 Variables de entorno (ver [`.env.example`](./.env.example)): `PORT`, `ADMIN_API_KEY`, `LICENSE_PRIVATE_KEY_PATH`, `TOG_PLATFORM_DATA`.

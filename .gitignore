@@ -20,3 +20,4 @@ graphify-out/
 # Dependencias y datos locales de desarrollo
 node_modules/
 data/
+data-smoke/

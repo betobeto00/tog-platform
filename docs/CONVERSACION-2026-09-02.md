@@ -93,7 +93,7 @@ Flujo completo del roadmap (sprint 1) implementado:
 
 ## 9. Pendientes / próximos pasos
 
-- **Stripe en producción**: crear productos/precios en el dashboard, configurar el webhook y probar un pago real de punta a punta (harness en `scripts/stripe-smoke.mjs`).
+- **Stripe en producción**: crear productos/precios en el dashboard, configurar el webhook y probar un pago real de punta a punta. Harness listo: `npm run smoke:stripe` (levanta el backend, crea precio + empresa, muestra el checkout y verifica la activación tras pagar con la tarjeta 4242…). Solo requiere `STRIPE_SECRET_KEY`/`STRIPE_WEBHOOK_SECRET` de prueba.
 - Despliegue del backend (hoy corre local con `node src/server.js`; necesitará HTTPS para el webhook).
 - QA manual en Electron del flujo “Config → Licencia → Sincronizar” contra un backend local (checklist en `docs/QA-SYNC.md`).
 - Pruebas unitarias de handlers del Distribuidor (clientes y pedidos) con DB en memoria — **159 tests tog-admin ✓**.
