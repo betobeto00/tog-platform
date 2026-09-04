@@ -16,6 +16,8 @@ Productor → Procesador → Comercializador → Distribuidor → Postventa
 
 Cada eslabón es un **módulo** que se activa/desactiva según lo que el cliente necesita. La activación es por licencia firmada (offline-first), no por instalador. Un solo `.exe` trae todos los módulos compilados.
 
+> 🎯 **Misión y Visión del ecosistema:** ver [`docs/MISION-VISION.md`](./docs/MISION-VISION.md). Es la fuente de identidad: un ecosistema modular, no un POS vertical para un rubro. Todo texto público debe reflejarla.
+
 ## Productos del ecosistema
 
 | Producto | Repo | Estado |
@@ -30,6 +32,7 @@ Toda la documentación vive en [`docs/`](./docs/).
 
 | Doc | Propósito |
 |-----|-----------|
+| [`MISION-VISION.md`](./docs/MISION-VISION.md) | Misión y Visión del ecosistema: identidad modular de la producción a la postventa. |
 | [`MODULOS.md`](./docs/MODULOS.md) | Catálogo de módulos (Productor, Procesador, Comercializador, Distribuidor, Postventa). Ediciones (Starter, Professional, Enterprise, Custom). Modelo de licenciamiento. Pricing de referencia. Roadmap por módulo. |
 | [`ARQUITECTURA-MODULAR.md`](./docs/ARQUITECTURA-MODULAR.md) | Diseño técnico del `ModuleManifest`, `ModuleContext`, `ModuleLoader`, EventBus entre módulos. Plan de migración del monolito actual a la arquitectura modular. Dualidad instalador/nube via `IDataSource`. |
 | [`FACTURACION-STRIPE.md`](./docs/FACTURACION-STRIPE.md) | Integración Stripe↔licencia. Backend de licencias (Node + Postgres + Stripe). Webhooks idempotentes. Grace period de 14 días. Modelo offline-first. Seguridad RSA. |
