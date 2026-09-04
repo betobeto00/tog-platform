@@ -310,6 +310,18 @@ Siguiendo el mismo patrón.
 
 ---
 
+## 10bis. Notas de visión (planificadas, no implementadas)
+
+Algunas decisiones de producto que **se documentan para cuando haya que desarrollarlas** (sin sobreingeniería):
+
+- **Login por módulo**: al iniciar sesión, el usuario elige el módulo al que entra (POS, Distribución, Producción, Administración, Recursos Humanos, Postventa, Restaurant…). No crea sesiones separadas: solo aterriza el usuario en su área. El admin asigna módulos/accesos por usuario.
+- **Rol manager / visor remoto**: un usuario manager puede **ver reportes remotos, agregar productos y modificar precios** sin estar sentado en una caja. Es un permiso sobre los handlers existentes (no un backend nuevo).
+- **Feedback desde el login**: botón en la pantalla de login que envía feedback del cliente a un **bot de Telegram** del dueño. Reusa el canal de contacto existente (igual que el landing); no requiere infraestructura nueva.
+
+> Estas notas NO son compromiso de implementación: se registran aquí para alinear la arquitectura cuando se desarrolle cada una (ver también `MODULOS.md` y `INTERCONEXION-RED.md`).
+
+---
+
 ## 11. Dualidad Instalador / Nube
 
 Cuando llegue el momento de ofrecer la versión nube, el cambio es **mínimo** si la arquitectura modular está bien hecha:
@@ -359,6 +371,7 @@ Para el caso nube:
 ## 13. Documentos relacionados
 
 - `MODULOS.md` — visión de producto, catálogo, pricing, roadmap por módulo.
+- `INTERCONEXION-RED.md` — visión de enlaces PC Base ↔ PC hijas por red local (planificado).
 - `FACTURACION-STRIPE.md` — sincronización licencia↔pago.
 - `INFORME-ERP.md` — auditoría técnica del estado actual.
 - `auto-license-stripe.md` — borrador original del flujo Stripe.

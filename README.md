@@ -33,7 +33,8 @@ Toda la documentación vive en [`docs/`](./docs/).
 | Doc | Propósito |
 |-----|-----------|
 | [`MISION-VISION.md`](./docs/MISION-VISION.md) | Misión y Visión del ecosistema: identidad modular de la producción a la postventa. |
-| [`MODULOS.md`](./docs/MODULOS.md) | Catálogo de módulos (Productor, Procesador, Comercializador, Distribuidor, Postventa). Ediciones (Starter, Professional, Enterprise, Custom). Modelo de licenciamiento. Pricing de referencia. Roadmap por módulo. |
+| [`MODULOS.md`](./docs/MODULOS.md) | Catálogo de módulos (Productor, Procesador, Comercializador, Distribuidor, Postventa, Administración/Contable, RRHH, Restaurant). Ediciones (Starter, Professional, Enterprise, Custom). Modelo de licenciamiento. Pricing de referencia. Roadmap por módulo. |
+| [`INTERCONEXION-RED.md`](./docs/INTERCONEXION-RED.md) | Visión de enlaces PC Base ↔ PC hijas por red local/Intranet: sesión única, tope por licencia, enlace seguro (planificación, no implementado). |
 | [`ARQUITECTURA-MODULAR.md`](./docs/ARQUITECTURA-MODULAR.md) | Diseño técnico del `ModuleManifest`, `ModuleContext`, `ModuleLoader`, EventBus entre módulos. Plan de migración del monolito actual a la arquitectura modular. Dualidad instalador/nube via `IDataSource`. |
 | [`FACTURACION-STRIPE.md`](./docs/FACTURACION-STRIPE.md) | Integración Stripe↔licencia. Backend de licencias (Node + Postgres + Stripe). Webhooks idempotentes. Grace period de 14 días. Modelo offline-first. Seguridad RSA. |
 | [`CONVERSACION-2025-09-01.md`](./docs/CONVERSACION-2025-09-01.md) | Bitácora de la sesión de diseño (limpieza del repo, visión de módulos, modelo de licenciamiento). |
