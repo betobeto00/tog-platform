@@ -24,8 +24,8 @@ La visión de **TOG Platform** es que cada eslabón sea un **módulo activable p
 | 0 | **Core (base)** | ✅ Existe (`tog-admin`) | UI shell, auth, licencia, IPC, persistencia local, auto-update | — |
 | 1 | **Productor** | 🟡 Diseño | Siembra, costos de campo, estimación de cosecha, logística de acopio | Core |
 | 2 | **Procesador** | 🟡 Diseño | Recepción de materia prima, recetas/BOM, transformación, mermas, lote de salida | Core + Productor (opcional) |
-| 3 | **Comercializador** | ✅ Parcial (`tog-admin`) | Inventario, compras, ventas, cotizaciones, caja, POS | Core |
-| 4 | **Distribuidor** | ✅ MVP v1 — clientes + pedidos CRUD (`tog-admin`, 2026-09; migraciones 015/016, gating por licencia, tests) | Clientes (documento de registro internacional: RIF, RFC, EIN…), pedidos con numeración y estados. Pendientes: remitos, listas de precio, crédito; rutas, flotas y despachos | Core + Comercializador |
+| 3 | **Comercializador** | ✅ Parcial (`tog-admin`) | Inventario (catálogo con producto/servicio, subcategorías, marca e imagen), compras, ventas (incl. **crédito/fiado** con cuentas por cobrar y abonos), cotizaciones, caja, POS | Core |
+| 4 | **Distribuidor** | ✅ MVP v1 — clientes + pedidos CRUD (`tog-admin`, 2026-09; migraciones 015/016, gating por licencia, tests) | Clientes (documento de registro internacional: RIF, RFC, EIN…), pedidos con numeración y estados. El **crédito a clientes vive en Comercializador** (migración 021): el POS vende fiado y valida `limite_credito` cuando se vincula a un cliente de este módulo. Pendientes: remitos, listas de precio, rutas, flotas y despachos | Core + Comercializador |
 | 5 | **Postventa** | 🟡 Diseño | Tickets de soporte, devoluciones, garantías, notas de crédito | Core + Comercializador |
 
 **Leyenda**: ✅ existe · 🟡 en diseño · ⚪ no iniciado
@@ -55,7 +55,7 @@ Una licencia es un JSON firmado RSA (la clave pública ya está embebida en `lic
 }
 ```
 
-> ⚠️ **Estado real (2-Sep-2026):** el JSON de arriba es la **visión de producto** (identidad empresa = `pais` ISO 3166-1 + `documento` de registro libre). El backend emite licencias firmadas con esta identidad (ver `src/server.js` / `src/sign.js`); la app las valida con la clave pública embebida (`tog-admin` → `src/main/services/license-crypto.ts`) y el gating de módulos es real (`useActiveModules` + permisos). El formato exacto de la licencia que guarda la app está en `tog-admin/docs/LICENCIAMIENTO.md`.
+> ⚠️ **Estado real (4-Sep-2026):** el JSON de arriba es la **visión de producto** (identidad empresa = `pais` ISO 3166-1 + `documento` de registro libre). El backend emite licencias firmadas con esta identidad (ver `src/server.js` / `src/sign.js`); la app las valida con la clave pública embebida (`tog-admin` → `src/main/services/license-crypto.ts`) y el gating de módulos es real (`useActiveModules` + permisos). El formato exacto de la licencia que guarda la app está en `tog-admin/docs/LICENCIAMIENTO.md`.
 
 El **Core** siempre está implícito. Si el cliente desactiva "Comercializador", el módulo sigue instalado pero el Sidebar y los handlers se ocultan.
 
@@ -173,7 +173,7 @@ Estos números son una **referencia para el roadmap**, no la tabla de precios fi
 
 ## 7. Roadmap por módulo
 
-### Inmediato (mes 0–2): habilitar el catálogo — ✅ hecho (2-Sep-2026)
+### Inmediato (mes 0–2): habilitar el catálogo — ✅ hecho (2-Sep-2026; Comercializador ampliado el 4-Sep-2026)
 - [x] Catálogo de módulos desde la licencia activa (`src/shared/modules.ts` + `useActiveModules` en tog-admin).
 - [x] Sidebar/Router/IPC filtran según módulos de la licencia y permisos.
 - [x] Config → Licencia muestra el catálogo y estado de módulos.
@@ -182,7 +182,8 @@ Estos números son una **referencia para el roadmap**, no la tabla de precios fi
 ### Corto plazo (mes 2–6): Distribuidor + Stripe
 - [x] Módulo Distribuidor: tablas `clientes`, `pedidos`, `pedido_detalles`, `remitos`, `listas_precio` (migraciones 015/016).
 - [x] CRUD de clientes y pedidos (numeración secuencial, estados) con tests.
-- [ ] Remitos y listas de precio con UI; crédito a clientes; rutas/flotas/despachos.
+- [x] Venta a crédito/fiado en Comercializador: método de pago `fiado` en el POS + página **Créditos** con saldos y abonos (migraciones 020–022 en `tog-admin`; validación de `limite_credito` del cliente cuando la licencia incluye Distribuidor).
+- [ ] Remitos y listas de precio con UI; rutas/flotas/despachos.
 - [x] Integración Stripe Checkout + webhooks + grace period — ⏸️ **EN ESPERA** de cliente que pague online.
 - [ ] Renovación automática online (idem, EN ESPERA).
 
