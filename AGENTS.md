@@ -56,10 +56,10 @@ para Stripe). Ver `.env.example`.
 | Método | Ruta | Auth | Descripción |
 |---|---|---|---|
 | GET | `/api/health` | — | Estado DB + clave de firma |
-| POST | `/api/empresas` | `X-Admin-Key` | Alta de empresa → genera `api_key` |
+| POST | `/api/empresas` | `X-Admin-Key` | Alta de empresa → genera `api_key` (`pais` ISO 3166-1 + `documento` libre) |
 | GET | `/api/admin/empresas` | `X-Admin-Key` | Listado de empresas |
-| POST | `/api/empresas/:id/licencias` | `X-Admin-Key` | Emite licencia firmada `{cliente, expira, modules?}` |
-| GET | `/api/empresas/:id/licencia` | `X-Api-Key` | Licencia activa (botón “Sincronizar” de TOG Admin) |
+| POST | `/api/empresas/:id/licencias` | `X-Admin-Key` | Emite licencia firmada `{cliente, expira, modules?, max_pcs?}`. `max_pcs` 1–20 habilita el módulo Red Local en tog-admin |
+| GET | `/api/empresas/:id/licencia` | `X-Api-Key` | Licencia activa (botón "Sincronizar" de TOG Admin) |
 | POST | `/api/checkout-session` | `X-Api-Key` | Stripe Checkout de módulo |
 | POST | `/api/webhook/stripe` | firma | Webhook idempotente |
 

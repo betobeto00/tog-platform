@@ -99,9 +99,19 @@ Si Roberto está offline 100%, el modelo degradado es: **tú le mandas la clave 
 
 Idea planificada (no implementada): al hacer login, el usuario **escoge el módulo al que va a entrar** (POS, Distribución, Producción, Administración, Recursos Humanos, Postventa, Restaurant…). Mientras la licencia activa todos los módulos que el usuario puede usar, el login le permite aterrizar directo en el área que le toca. Esto **no** implica módulos separados por usuario: el admin asigna qué módulos y accesos ve cada usuario (ver `INTERCONEXION-RED.md` para el rol manager).
 
-### 3.6 Multi-PC por red local (planificado)
+### 3.6 Multi-PC por red local (implementado — spike funcional)
 
-La licencia define el número de PCs conectadas: **1 PC/1 caja** (solo la Base) o **multi-PC de 2 a 20** (Base + hijas). **Un usuario solo puede estar con sesión activa en una PC a la vez** (admin en PC 1 no entra en PC 2). Detalle de la mecánica (enlace, token, anti-bypass) en `INTERCONEXION-RED.md`.
+La licencia define el número de PCs conectadas: **1 PC/1 caja** (solo la Base, `max_pcs=1` por default) o **multi-PC de 2 a 20** (Base + hijas, `max_pcs` en la licencia firmada). **Un usuario solo puede estar con sesión activa en una PC a la vez**: `services/red-session.ts` en tog-admin registra `sesiones_activas(usuario_id UNIQUE, par_id, sesion_token)` y rechaza el login si el mismo usuario está activo en otro `par_id`.
+
+Implementación backend de licencias (tog-platform):
+
+- `POST /api/empresas/:id/licencias` acepta `max_pcs` (1–20) en el body y lo incluye firmado en la licencia. Validación en `signLicense` (`src/sign.js`): enteros en rango 1–20; un valor fuera de rango → 400.
+- Licencia emitida por Stripe (`emitirLicencia` en `src/server.js`) **no** setea `max_pcs` explícitamente (queda implícito = 1, solo la Base). Si en el futuro un plan de Stripe requiere multi-PC, se debe pasar `max_pcs` por ahí también.
+- `src/server.test.js` cubre el caso (rango válido + fuera de rango).
+
+Implementación en tog-admin (migración 031): `pcs_enlazadas`, `sesiones_activas`, `codigos_enlace`. Servicios `red-{config,server,client,session}.ts`. Módulo `red/handlers.ts`. `SetupPage` para PC Hija. UI en Config → Sistema → Red Local.
+
+**Pendiente para producción**: TLS local con cert autofirmado generado al primer arranque de la Base y heartbeat 60 s para expulsar sesiones huérfanas. Detalle completo en `docs/INTERCONEXION-RED.md`.
 
 ---
 
@@ -211,8 +221,9 @@ Estos números son una **referencia para el roadmap**, no la tabla de precios fi
 - [ ] Módulo Administración: submódulo **contable** completo (libros: compras, ventas, inventario, mayor, diario; **retenciones de ley según el país del cliente**), reportes de gestión.
 - [ ] Módulo Recursos Humanos (empleados, nómina básica, asistencia).
 - [x] Módulo Restaurant (mesas, comanda, cocina) — **MVP v1 (4-Sep-2026)**: ver `tog-admin/docs/DISENO-MODULO-RESTAURANTE.md` y `tog-admin/docs/FEATURES.md` (RST1–RST5). Pendientes v2: cuentas divididas, enrutado de comandas a una impresora térmica dedicada (la impresión de comanda ya existe vía el flujo estándar), propinas, áreas del salón.
-- [ ] Interconexión por red local/Intranet entre PC Base y PC hijas (ver `INTERCONEXION-RED.md`).
-- [ ] Multi-moneda, multi-idioma, fiscal por país.
+- [x] Interconexión por red local/Intranet entre PC Base y PC hijas — **spike funcional mergeado (5-Sep-2026)**: ver `tog-admin/docs/ARCHITECTURE.md` sección "Módulo Red Local" + `INTERCONEXION-RED.md`. Pendiente para producción: TLS local + heartbeat 60 s.
+- [x] Multi-moneda + símbolo + tasa de cambio (5-Sep-2026) — vive en `configuracion` de tog-admin.
+- [ ] Fiscal por país (SENIAT, SUNAT, etc.) — hooks previstos en el Core; proyectos separados.
 
 ---
 

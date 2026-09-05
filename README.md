@@ -99,6 +99,7 @@ Cuando llegue el momento de la nube, **no hay reescritura**: solo se cambia la i
 | ✅ 1 | Backend de licencias en este repo (SQLite + firma RSA) — ver sección siguiente |
 | ✅ 1 | Sincronización licencia local ↔ backend (canal pre-auth `license:sync` en Config y bloqueo) |
 | ✅ 5 | Módulo Distribuidor MVP en tog-admin (clientes + pedidos; gating por licencia; flujo Sincronizar validado e2e con `qa-sync`) |
+| ✅ 5 | Interconexión PC Base + PC hijas (spike funcional) — `max_pcs` en `POST /api/empresas/:id/licencias`, migración 031 + módulo `red/` en tog-admin. Pendiente para producción: TLS local + heartbeat 60 s (ver `INTERCONEXION-RED.md`) |
 | ⏸️ 2 | Stripe Checkout + webhooks + grace period de 14 días — **implementados y testeados, en espera** hasta que un cliente quiera pagar online |
 | 🟡 3 | Customer Portal + panel admin web mínimo |
 
@@ -142,7 +143,7 @@ Variables de entorno (ver [`.env.example`](./.env.example)): `PORT`, `ADMIN_API_
 | `GET` | `/api/health` | — | Estado (DB + clave de firma) |
 | `POST` | `/api/empresas` | `X-Admin-Key` | Alta de empresa: `{ nombre, pais?, documento, email_contacto }` → genera `api_key` |
 | `GET` | `/api/admin/empresas` | `X-Admin-Key` | Listado de empresas |
-| `POST` | `/api/empresas/:id/licencias` | `X-Admin-Key` | Emisión manual de licencia firmada `{ cliente, expira, modules? }` |
+| `POST` | `/api/empresas/:id/licencias` | `X-Admin-Key` | Emisión manual de licencia firmada `{ cliente, expira, modules?, max_pcs? }`. `max_pcs` 1–20 (default 1) habilita el módulo Red Local en tog-admin |
 | `GET` | `/api/empresas/:id/licencia` | `X-Api-Key` | Licencia activa para el botón “Sincronizar” de la app |
 | `POST` | `/api/checkout-session` | `X-Api-Key` | Suscripción de un módulo vía Stripe Checkout (`{ modulo }`). Requiere `STRIPE_SECRET_KEY` + `STRIPE_PRICE_<MODULO>` |
 | `POST` | `/api/webhook/stripe` | firma | Eventos idempotentes: activa la licencia al pagar (`checkout.session.completed`) |

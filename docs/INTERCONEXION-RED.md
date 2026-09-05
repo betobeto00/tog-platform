@@ -119,8 +119,49 @@ Pensada para活在 en SQLite de la Base cuando se implemente:
 - `FACTURACION-STRIPE.md` — política anti-sobreingeniería (en espera hasta
   cliente que lo pida).
 
-## Estado
+## Estado — spike funcional implementado (2026-09-05)
 
-🕓 Pendiente. **No se prioriza** hasta que un cliente con varias PCs lo pida
-explícitamente. La arquitectura offline-first de tog-admin sigue siendo la
-prioridad: una PC por licencia funciona perfectamente hoy.
+✅ **Primera fase implementada y testeada** (tog-admin + tog-platform):
+
+- **Migración 032** en tog-admin: tablas `pcs_enlazadas`, `sesiones_activas`,
+  `codigos_enlace` (SQLite de la Base).
+- **PC Base**: servidor HTTP local `:3002` dentro del main process
+  (`src/main/services/red-server.ts`, Node `http`, cero deps). Endpoints:
+  `POST /api/red/vincular` (handshake con código de enlace de un solo uso,
+  expiración 5 min), `POST /api/red/rpc` (despacho genérico de canales IPC
+  hacia los mismos handlers de la app), `POST /api/red/logout`.
+- **Sesión única**: `src/main/services/red-session.ts` — al hacer login
+  (local o vía RPC) se registra la sesión con el `par_id`; si el usuario ya
+  tiene sesión en OTRO par, el login se rechaza. Al cerrar la app hija o
+  desloguear, la hija avisa a la Base (`red:logout` / `before-quit`) y se
+  libera la sesión.
+- **PC Hija**: mismo `.exe`. `SetupPage` (primer inicio, cuando no hay
+  licencia local) pide IP de la Base + código de enlace + nombre de PC.
+  `ipc-handlers.ts` en modo hija registra solo los canales locales
+  (app:version, i18n, crash-report, update, red:*) y reenvía el resto por
+  HTTP a la Base (`src/main/services/red-client.ts`).
+- **Tope de PCs**: la licencia firmada acepta `max_pcs` (1–20, default 1 =
+  solo la Base). La Base rechaza vincular más PCs que `max_pcs`.
+  `tog-platform` emite el campo (endpoint manual y `signLicense`).
+- **UI**: Config → Sistema → Red Local (generar código, listar PCs enlazadas,
+  desvincular hija). i18n ES/EN. Permiso `red_manage` (solo admin).
+- **Tests**: `red-session.test.ts` (sesión única) y `red-server.test.ts`
+  (vincular/rpc/logout/tope, DB en memoria) en tog-admin; `max_pcs` en
+  `server.test.js` de tog-platform.
+
+### Pendiente para fases siguientes
+
+- 🔒 **Transporte TLS local**: el spike usa HTTP plano en LAN con
+  credenciales de par (par_id + cert_hash) + token de enlace de un solo uso.
+  TLS con cert autofirmado generado al primer arranque de la Base queda
+  pendiente (decisión pendiente del doc original).
+- ❤️ **Heartbeat automático** (60s) para expulsar sesiones huérfanas; hoy la
+  sesión se libera al cerrar/desloguear la hija (best-effort).
+- 🖥️ **UI completa de gestión de PCs** en Config (hoy solo handshake básico).
+- 📦 Topología multi-sucursal y sync entre bases (Fase 7).
+
+> Smoke test: dos copias del `.exe` en la misma red — activar licencia en la
+> primera (Base), emitir licencia con `max_pcs >= 2` (o re-emitir la de
+> prueba con `max_pcs`), generar código desde Config → Sistema → Red Local,
+> vincular la segunda PC. Verificar datos compartidos y que el login del
+> mismo usuario en dos PCs se rechaza.
