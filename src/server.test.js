@@ -178,6 +178,24 @@ test('licencia: api_key desconocida → 401, empresa sin licencia → 404', asyn
   assert.equal(sinLicencia.status, 404)
 })
 
+test('emisión manual acepta max_pcs y lo incluye firmado en la licencia', async () => {
+  const res = await post(
+    `/api/empresas/${empresa.id}/licencias`,
+    { cliente: 'MultiPC S.A.', expira: '2099-12-31', modules: ['distribuidor'], max_pcs: 5 },
+    adminHeaders,
+  )
+  assert.equal(res.status, 201)
+  assert.equal(res.json.licencia.max_pcs, 5)
+  assert.equal(verifySignature(res.json.licencia), true, 'max_pcs queda cubierto por la firma')
+
+  const invalido = await post(
+    `/api/empresas/${empresa.id}/licencias`,
+    { cliente: 'X', expira: '2099-12-31', max_pcs: 99 },
+    adminHeaders,
+  )
+  assert.equal(invalido.status, 400)
+})
+
 test('emisión manual valida campos y módulos desconocidos', async () => {
   const sinCampos = await post(
     `/api/empresas/${empresa.id}/licencias`,

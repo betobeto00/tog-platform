@@ -13,12 +13,15 @@ export const MODULE_IDS = ['comercializador', 'distribuidor', 'restaurant', 'pro
  *  - firma RSA-SHA256 (PKCS#1 v1.5) sobre JSON.stringify(payload sin "firma")
  *  - el archivo resultante es JSON con { ...payload, firma } listo para importar
  */
-export function signLicense(privateKey, { cliente, expira, machineId = null, modules = null }) {
+export function signLicense(privateKey, { cliente, expira, machineId = null, modules = null, maxPcs = null }) {
   if (!cliente || !expira) throw new Error('cliente y expira son requeridos')
   if (!/^\d{4}-\d{2}-\d{2}$/.test(expira)) throw new Error('expira debe ser YYYY-MM-DD')
   if (modules) {
     const unknown = modules.filter((m) => !MODULE_IDS.includes(m))
     if (unknown.length) throw new Error(`Módulo(s) desconocido(s): ${unknown.join(', ')}`)
+  }
+  if (maxPcs != null && (!Number.isInteger(maxPcs) || maxPcs < 1 || maxPcs > 20)) {
+    throw new Error('max_pcs debe ser un entero entre 1 y 20')
   }
 
   const payload = {
@@ -27,6 +30,7 @@ export function signLicense(privateKey, { cliente, expira, machineId = null, mod
     version: '1.0.0',
     machineId,
     ...(modules && modules.length ? { modules } : {}),
+    ...(maxPcs != null ? { max_pcs: maxPcs } : {}),
     emitida: new Date().toISOString(),
     id: crypto.randomBytes(6).toString('hex'),
   }

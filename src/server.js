@@ -248,12 +248,12 @@ async function handle(req, res) {
     if (!empresa) return json(res, 404, { success: false, error: 'Empresa no encontrada' })
 
     const body = await readBody(req)
-    const { cliente, expira, machine_id = null, modules = null } = body || {}
+    const { cliente, expira, machine_id = null, modules = null, max_pcs = null } = body || {}
     if (!cliente || !expira) return json(res, 400, { success: false, error: 'cliente y expira son requeridos' })
 
     let license
     try {
-      license = signLicense(privateKey, { cliente, expira, machineId: machine_id, modules })
+      license = signLicense(privateKey, { cliente, expira, machineId: machine_id, modules, maxPcs: max_pcs })
     } catch (err) {
       return json(res, 400, { success: false, error: err.message })
     }
