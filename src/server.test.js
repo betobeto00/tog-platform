@@ -219,6 +219,20 @@ test('emisión manual valida campos y módulos desconocidos', async () => {
   assert.equal(fechaInvalida.status, 400)
 })
 
+test('emisión manual acepta los nuevos módulos administracion y rrhh', async () => {
+  const res = await post(
+    `/api/empresas/${empresa.id}/licencias`,
+    { cliente: 'Contable Plus S.A.', expira: '2099-12-31', modules: ['administracion', 'rrhh'] },
+    adminHeaders,
+  )
+  assert.equal(res.status, 201)
+  const licencia = res.json.licencia
+  // La emisión manual firma los modules tal cual se envían (el orden canónico
+  // de MODULE_IDS solo aplica al flujo de compra por suscripción)
+  assert.deepEqual(licencia.modules, ['administracion', 'rrhh'])
+  assert.equal(verifySignature(licencia), true, 'la firma debe cubrir los nuevos módulos')
+})
+
 test('checkout y webhook devuelven 503 cuando Stripe no está configurado', async () => {
   const checkout = await post('/api/checkout-session', { modulo: 'distribuidor' }, {
     'x-api-key': empresa.api_key,
