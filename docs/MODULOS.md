@@ -27,8 +27,8 @@ La visión de **TOG Platform** es que cada eslabón sea un **módulo activable p
 | 3 | **Comercializador** | ✅ Parcial (`tog-admin`) | Inventario (catálogo con producto/servicio, subcategorías, marca e imagen), compras, ventas (incl. **crédito/fiado** con cuentas por cobrar y abonos), cotizaciones, caja, POS | Core |
 | 4 | **Distribuidor** | ✅ MVP v1 — clientes + pedidos CRUD (`tog-admin`, 2026-09; migraciones 015/016, gating por licencia, tests) | Clientes (documento de registro internacional: RIF, RFC, EIN…), pedidos con numeración y estados. El **crédito a clientes vive en Comercializador** (migración 021): el POS vende fiado y valida `limite_credito` cuando se vincula a un cliente de este módulo. Pendientes: remitos, listas de precio, rutas, flotas y despachos | Core + Comercializador |
 | 5 | **Postventa** | 🟡 Diseño | Tickets de soporte, devoluciones, garantías, notas de crédito | Core + Comercializador |
-| 6 | **Administración** | 🟡 Diseño | **Submódulo Contable** (libros: compras, ventas, inventario, mayor, diario; retenciones de ley según el país del cliente), reportes de gestión | Core + Comercializador |
-| 7 | **Recursos Humanos** | 🟡 Diseño | Empleados, roles, nómina básica, asistencia (alcance a definir al implementar) | Core |
+| 6 | **Administración** | ✅ MVP v1 (`tog-admin`, migración 034, 5-Sep-2026; gating por licencia y permisos, tests) | **Submódulo Contable**: resumen ejecutivo del período, libro de ventas, libro de compras, libro de inventario con kardex, libro diario (asientos automáticos por venta/compra), export CSV para el contador. Pendientes: retenciones de ley por país, mayor y balance | Core + Comercializador |
+| 7 | **Recursos Humanos** | ✅ MVP v1 (`tog-admin`, migración 035, 5-Sep-2026; gating por licencia y permisos, tests) | Empleados (CRUD + baja lógica), asistencia diaria (presente/tarde/ausente), nómina por período proporcional a asistencia con bonos y deducciones, pago de nómina. Pendientes: roles finos, beneficios legales por país | Core |
 | 8 | **Restaurant** | ✅ MVP v1 (migración 024, gating por licencia y permisos, tests) | Mesas (CRUD + estado libre/ocupada), comanda por mesa (productos del catálogo con precio autocompletado + ítems manuales), pantalla de cocina (en preparación/listo/servido), **cobro de mesa** que factura solo ítems servidos/listos reutilizando `createVenta` (stock, combos, fiado, caja) | Core + Comercializador |
 
 **Leyenda**: ✅ existe · 🟡 en diseño · ⚪ no iniciado
@@ -185,6 +185,8 @@ Migración gradual:
 | Productor (addon) | $25/mes |
 | Procesador (addon) | $30/mes (más complejo, recetas) |
 | Postventa (addon) | $15/mes |
+| Administración/Contable (addon) | $25/mes |
+| Recursos Humanos (addon) | $25/mes |
 | Bundle Professional (Core+Comerc+Distrib) | $70/mes (vs. $80) |
 | Bundle Enterprise (todos) | $140/mes (vs. $145) |
 | Cloud (sustituye instalador local) | +$50/mes |
@@ -218,8 +220,8 @@ Estos números son una **referencia para el roadmap**, no la tabla de precios fi
 ### Largo plazo (mes 12+): Nube + Postventa + multi-País + módulos transversales
 - [ ] Modo nube con Postgres + autenticación central.
 - [ ] Módulo Postventa.
-- [ ] Módulo Administración: submódulo **contable** completo (libros: compras, ventas, inventario, mayor, diario; **retenciones de ley según el país del cliente**), reportes de gestión.
-- [ ] Módulo Recursos Humanos (empleados, nómina básica, asistencia).
+- [x] Módulo Administración: submódulo **contable** — **MVP v1 (5-Sep-2026)**: resumen, libros de ventas/compras/inventario + kardex, libro diario con asientos automáticos, export CSV. Pendiente: retenciones de ley por país (proyecto fiscal separado) y mayor/balance.
+- [x] Módulo Recursos Humanos — **MVP v1 (5-Sep-2026)**: empleados, asistencia, nómina por período con bonos/deducciones y pago. Pendiente: roles finos y beneficios legales por país.
 - [x] Módulo Restaurant (mesas, comanda, cocina) — **MVP v1 (4-Sep-2026)**: ver `tog-admin/docs/DISENO-MODULO-RESTAURANTE.md` y `tog-admin/docs/FEATURES.md` (RST1–RST5). Pendientes v2: cuentas divididas, enrutado de comandas a una impresora térmica dedicada (la impresión de comanda ya existe vía el flujo estándar), propinas, áreas del salón.
 - [x] Interconexión por red local/Intranet entre PC Base y PC hijas — **spike funcional mergeado (5-Sep-2026)**: ver `tog-admin/docs/ARCHITECTURE.md` sección "Módulo Red Local" + `INTERCONEXION-RED.md`. Pendiente para producción: TLS local + heartbeat 60 s.
 - [x] Multi-moneda + símbolo + tasa de cambio (5-Sep-2026) — vive en `configuracion` de tog-admin.
