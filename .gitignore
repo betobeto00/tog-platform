@@ -21,3 +21,6 @@ graphify-out/
 node_modules/
 data/
 data-smoke/
+
+# Logs de runtime
+*.log

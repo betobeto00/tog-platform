@@ -151,12 +151,14 @@ Pensada para活在 en SQLite de la Base cuando se implemente:
 
 ### Pendiente para fases siguientes
 
-- 🔒 **Transporte TLS local**: el spike usa HTTP plano en LAN con
-  credenciales de par (par_id + cert_hash) + token de enlace de un solo uso.
-  TLS con cert autofirmado generado al primer arranque de la Base queda
-  pendiente (decisión pendiente del doc original).
-- ❤️ **Heartbeat automático** (60s) para expulsar sesiones huérfanas; hoy la
-  sesión se libera al cerrar/desloguear la hija (best-effort).
+- 🔒 **Transporte TLS local**: ✅ **implementado (5-Sep-2026)** — la Base
+  genera un cert autofirmado al primer arranque (`services/red-cert.ts` en
+  tog-admin) y expone HTTPS en `:3002`; la hija ancla al cert recibido en el
+  handshake inicial (sin `rejectUnauthorized: false` global).
+- ❤️ **Heartbeat automático** (60s): ✅ **implementado (5-Sep-2026)** —
+  `useRedHeartbeat` en la hija + endpoint de heartbeat en la Base; la sesión
+  huérfana (par sin heartbeat > 5 min) se libera. La liberación al
+  cerrar/desloguear sigue como best-effort adicional.
 - 🖥️ **UI completa de gestión de PCs** en Config (hoy solo handshake básico).
 - 📦 Topología multi-sucursal y sync entre bases (Fase 7).
 
