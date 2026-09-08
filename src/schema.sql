@@ -12,6 +12,9 @@ CREATE TABLE IF NOT EXISTS empresas (
   email_contacto     TEXT NOT NULL,
   api_key            TEXT UNIQUE NOT NULL,
   stripe_customer_id TEXT UNIQUE,
+  device_fingerprint TEXT,
+  payment_status     TEXT DEFAULT 'pending',
+  payment_confirmed_at TEXT,
   created_at         TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE (pais, documento)
 );

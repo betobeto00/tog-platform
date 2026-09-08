@@ -29,6 +29,14 @@ for (const columna of ['failed_at', 'grace_ends_at']) {
   }
 }
 
+// Columnas para OmniServ: device_fingerprint, payment_status, payment_confirmed_at
+const colsEmpresas = db.prepare('PRAGMA table_info(empresas)').all().map((c) => c.name)
+for (const columna of ['device_fingerprint', 'payment_status', 'payment_confirmed_at']) {
+  if (!colsEmpresas.includes(columna)) {
+    db.exec(`ALTER TABLE empresas ADD COLUMN ${columna} TEXT`)
+  }
+}
+
 export function closeDatabase() {
   try {
     db.close()

@@ -244,6 +244,82 @@ async function handle(req, res) {
     return json(res, 200, { empresas: rows })
   }
 
+  // POST /api/empresas/register  (público) — registro de cliente desde la app
+  if (method === 'POST' && path === '/api/empresas/register') {
+    const body = await readBody(req)
+    const nombre = typeof body?.nombre === 'string' ? body.nombre.trim() : ''
+    const pais = (typeof body?.pais === 'string' ? body.pais.trim().toUpperCase() : 'VE') || 'VE'
+    const documento = typeof body?.documento === 'string' ? body.documento.trim().toUpperCase() : ''
+    const emailContacto = typeof body?.email_contacto === 'string' ? body.email_contacto.trim() : ''
+    const deviceFingerprint = typeof body?.device_fingerprint === 'string' ? body.device_fingerprint.trim() : ''
+
+    if (!nombre || !documento || !emailContacto) {
+      return json(res, 400, { success: false, error: 'nombre, documento y email_contacto son requeridos' })
+    }
+    if (!/^[A-Z]{2}$/.test(pais)) {
+      return json(res, 400, { success: false, error: 'pais debe ser un código ISO 3166-1 alpha-2' })
+    }
+
+    const apiKey = crypto.randomBytes(16).toString('hex')
+    try {
+      const result = db
+        .prepare('INSERT INTO empresas (nombre, pais, documento, email_contacto, api_key, device_fingerprint, payment_status) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run(nombre, pais, documento, emailContacto, apiKey, deviceFingerprint, 'pending')
+      return json(res, 201, { 
+        success: true, 
+        data: { 
+          id: result.lastInsertRowid, 
+          api_key: apiKey 
+        } 
+      })
+    } catch (err) {
+      return json(res, 409, { success: false, error: `Error al registrar: ${err.message}` })
+    }
+  }
+
+  // GET /api/payment/confirm — confirmación de pago desde Crixto
+  if (method === 'GET' && path === '/api/payment/confirm') {
+    const empresaId = url.searchParams.get('empresa_id')
+    if (!empresaId) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+      res.end(paginaSimple('Error', 'Falta el ID de empresa'))
+      return
+    }
+
+    try {
+      db.prepare('UPDATE empresas SET payment_status = ?, payment_confirmed_at = datetime(\'now\') WHERE id = ?')
+        .run('confirmed', Number(empresaId))
+      
+      // Emitir licencia automática
+      const empresa = db.prepare('SELECT * FROM empresas WHERE id = ?').get(Number(empresaId))
+      if (empresa && privateKey) {
+        emitirLicencia(empresa, { modulo: 'omniserv', por: 'crixto:auto' })
+      }
+
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+      res.end(paginaSimple('✅ Pago Confirmado', 'Tu licencia ha sido activada. Vuelve a la app y presiona "Verificar Pago".'))
+    } catch (err) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+      res.end(paginaSimple('Error', 'Error al procesar el pago. Contacta soporte.'))
+    }
+    return
+  }
+
+  // GET /api/empresas/:id/payment-status — verificar estado de pago
+  const paymentStatusMatch = path.match(/^\/api\/empresas\/(\d+)\/payment-status$/)
+  if (method === 'GET' && paymentStatusMatch) {
+    const empresa = requireEmpresa(req, res)
+    if (!empresa) return
+
+    const empresaId = Number(paymentStatusMatch[1])
+    const emp = db.prepare('SELECT payment_status FROM empresas WHERE id = ?').get(empresaId)
+    
+    return json(res, 200, { 
+      success: true, 
+      payment_confirmed: emp?.payment_status === 'confirmed' 
+    })
+  }
+
   // POST /api/empresas/:id/licencias  (admin) — emisión manual de licencia
   const licenciasMatch = path.match(/^\/api\/empresas\/(\d+)\/licencias$/)
   if (method === 'POST' && licenciasMatch) {
