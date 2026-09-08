@@ -34,11 +34,17 @@ const GRACE_DAYS = Number(process.env.LICENSE_GRACE_DAYS || 14)
 
 let privateKey = null
 try {
-  privateKey = loadPrivateKey(PRIVATE_KEY_PATH)
-  console.log(`🔑 Clave privada cargada desde ${PRIVATE_KEY_PATH}`)
+  // Primero intentar desde variable de entorno (para Railway)
+  if (process.env.LICENSE_PRIVATE_KEY) {
+    privateKey = process.env.LICENSE_PRIVATE_KEY
+    console.log('🔑 Clave privada cargada desde variable de entorno')
+  } else {
+    privateKey = loadPrivateKey(PRIVATE_KEY_PATH)
+    console.log(`🔑 Clave privada cargada desde ${PRIVATE_KEY_PATH}`)
+  }
 } catch (err) {
-  console.warn(`⚠️  No se pudo cargar la clave privada (${PRIVATE_KEY_PATH}): ${err.message}`)
-  console.warn('   La emisión de licencias no estará disponible hasta configurar LICENSE_PRIVATE_KEY_PATH')
+  console.warn(`⚠️  No se pudo cargar la clave privada: ${err.message}`)
+  console.warn('   La emisión de licencias no estará disponible hasta configurar LICENSE_PRIVATE_KEY')
 }
 
 // ---------- utilidades ----------
