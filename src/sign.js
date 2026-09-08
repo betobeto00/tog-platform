@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 
 // Módulos activables de TOG Platform.
 // Mantener sincronizado con src/shared/modules.ts del repo tog-admin.
-export const MODULE_IDS = ['comercializador', 'distribuidor', 'restaurant', 'productor', 'procesador', 'postventa', 'administracion', 'rrhh']
+export const MODULE_IDS = ['comercializador', 'distribuidor', 'restaurant', 'productor', 'procesador', 'postventa', 'administracion', 'rrhh', 'omniserv']
 
 /**
  * Firma una licencia con el MISMO formato que valida TOG Admin
