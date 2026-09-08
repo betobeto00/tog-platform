@@ -205,6 +205,11 @@ async function handle(req, res) {
     return json(res, 200, { ok: true, db: true, firmando: !!privateKey, tiempo: new Date().toISOString() })
   }
 
+  // GET /api/time — hora del servidor (para validar contra manipulación de fecha local)
+  if (method === 'GET' && path === '/api/time') {
+    return json(res, 200, { server_time: Date.now(), iso: new Date().toISOString() })
+  }
+
   // POST /api/empresas  (admin) — alta inicial de empresa, genera api_key
   // Identificación internacional: pais (ISO 3166-1 alpha-2) + documento de
   // registro/tributario (RIF, EIN, NIT, CUIT, CNPJ, VAT…). Un mismo número en
