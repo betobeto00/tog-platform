@@ -242,11 +242,31 @@ async function handle(req, res) {
     }
   }
 
-  // GET /api/admin/empresas  (admin) — listado
+  // GET /api/admin/empresas  (admin) — listado (incluye vínculo de dispositivo)
   if (method === 'GET' && path === '/api/admin/empresas') {
     if (!requireAdmin(req, res)) return
-    const rows = db.prepare('SELECT id, nombre, pais, documento, email_contacto, created_at FROM empresas ORDER BY created_at DESC').all()
+    const rows = db.prepare('SELECT id, nombre, pais, documento, email_contacto, device_fingerprint, payment_status, created_at FROM empresas ORDER BY created_at DESC').all()
     return json(res, 200, { empresas: rows })
+  }
+
+  // POST /api/admin/empresas/:id/dispositivo  (admin) — transferencia de licencia a otro teléfono
+  // { device_fingerprint: null }     → desvincula: el próximo teléfono que reclame la licencia queda vinculado
+  // { device_fingerprint: "<hash>" } → vincula directamente al dispositivo indicado
+  const dispositivoMatch = path.match(/^\/api\/admin\/empresas\/(\d+)\/dispositivo$/)
+  if (method === 'POST' && dispositivoMatch) {
+    if (!requireAdmin(req, res)) return
+    const empresaId = Number(dispositivoMatch[1])
+    if (!db.prepare('SELECT id FROM empresas WHERE id = ?').get(empresaId)) {
+      return json(res, 404, { success: false, error: 'Empresa no encontrada' })
+    }
+    const body = await readBody(req)
+    const nuevo = typeof body?.device_fingerprint === 'string' ? body.device_fingerprint.trim() : null
+    if (nuevo === '') {
+      return json(res, 400, { success: false, error: 'device_fingerprint debe ser un hash no vacío o null (para desvincular)' })
+    }
+    db.prepare('UPDATE empresas SET device_fingerprint = ? WHERE id = ?').run(nuevo, empresaId)
+    const row = db.prepare('SELECT id, device_fingerprint FROM empresas WHERE id = ?').get(empresaId)
+    return json(res, 200, { success: true, empresa_id: row.id, device_fingerprint: row.device_fingerprint })
   }
 
   // POST /api/empresas/register  (público) — registro de cliente desde la app
@@ -264,6 +284,35 @@ async function handle(req, res) {
     if (!/^[A-Z]{2}$/.test(pais)) {
       return json(res, 400, { success: false, error: 'pais debe ser un código ISO 3166-1 alpha-2' })
     }
+    if (!deviceFingerprint || deviceFingerprint.length > 128) {
+      return json(res, 400, { success: false, error: 'device_fingerprint es requerido (hash SHA-256 del dispositivo)' })
+    }
+
+    // Verificar si ya existe una empresa con ese país y documento
+    const existente = db.prepare('SELECT id, api_key, nombre, email_contacto, payment_status, device_fingerprint FROM empresas WHERE pais = ? AND documento = ?').get(pais, documento)
+    if (existente) {
+      // Licencia de un solo dispositivo: si los mismos datos vienen de otro
+      // teléfono, no se revela la api_key (aquí es donde se bypaseaba la licencia).
+      if (existente.device_fingerprint && existente.device_fingerprint !== deviceFingerprint) {
+        return json(res, 403, {
+          success: false,
+          code: 'DEVICE_MISMATCH',
+          error: 'Dispositivo no autorizado',
+          message: 'Esta licencia ya está activada en otro dispositivo. Contacta soporte para transferir la licencia.',
+        })
+      }
+      return json(res, 200, {
+        success: true,
+        already_registered: true,
+        data: {
+          id: existente.id,
+          api_key: existente.api_key,
+          nombre: existente.nombre,
+          email_contacto: existente.email_contacto,
+          payment_status: existente.payment_status
+        }
+      })
+    }
 
     const apiKey = crypto.randomBytes(16).toString('hex')
     try {
@@ -278,7 +327,7 @@ async function handle(req, res) {
         } 
       })
     } catch (err) {
-      return json(res, 409, { success: false, error: `Error al registrar: ${err.message}` })
+      return json(res, 500, { success: false, error: `Error al registrar: ${err.message}` })
     }
   }
 
@@ -295,10 +344,10 @@ async function handle(req, res) {
       db.prepare('UPDATE empresas SET payment_status = ?, payment_confirmed_at = datetime(\'now\') WHERE id = ?')
         .run('confirmed', Number(empresaId))
       
-      // Emitir licencia automática
+      // Emitir licencia automática (1 mes para suscripción mensual)
       const empresa = db.prepare('SELECT * FROM empresas WHERE id = ?').get(Number(empresaId))
       if (empresa && privateKey) {
-        emitirLicencia(empresa, { modulo: 'omniserv', por: 'crixto:auto' })
+        emitirLicencia(empresa, { modulo: 'omniserv', por: 'crixto:auto', meses: 1 })
       }
 
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
@@ -316,12 +365,11 @@ async function handle(req, res) {
     const empresa = requireEmpresa(req, res)
     if (!empresa) return
 
-    const empresaId = Number(paymentStatusMatch[1])
-    const emp = db.prepare('SELECT payment_status FROM empresas WHERE id = ?').get(empresaId)
-    
-    return json(res, 200, { 
-      success: true, 
-      payment_confirmed: emp?.payment_status === 'confirmed' 
+    // Se usa la empresa autenticada por api_key (no el id de la URL) para no
+    // filtrar el estado de pago de otras empresas (IDOR).
+    return json(res, 200, {
+      success: true,
+      payment_confirmed: empresa.payment_status === 'confirmed'
     })
   }
 
@@ -372,6 +420,39 @@ async function handle(req, res) {
     } catch (err) {
       console.error('[licencia] error al barrer impagos vencidos', err.message)
     }
+    
+    // Licencia de un solo dispositivo (OmniServ): el teléfono SIEMPRE envía su
+    // fingerprint en el header x-device-fingerprint. TOG Admin no lo envía y no
+    // debe afectarse: el control solo aplica cuando el header viene en la petición.
+    const deviceFingerprint = String(req.headers['x-device-fingerprint'] || url.searchParams.get('device_fingerprint') || '').trim()
+    if (deviceFingerprint) {
+      if (!empresa.device_fingerprint) {
+        // Primer dispositivo que reclama la licencia: queda vinculado (atómico;
+        // si otro teléfono lo reclamó en paralelo, gana el primero).
+        const claimed = db
+          .prepare('UPDATE empresas SET device_fingerprint = ? WHERE id = ? AND device_fingerprint IS NULL')
+          .run(deviceFingerprint, empresa.id)
+        if (claimed.changes === 0) {
+          const ahora = db.prepare('SELECT device_fingerprint FROM empresas WHERE id = ?').get(empresa.id)
+          if (ahora?.device_fingerprint !== deviceFingerprint) {
+            return json(res, 403, {
+              success: false,
+              code: 'DEVICE_MISMATCH',
+              error: 'Dispositivo no autorizado',
+              message: 'Esta licencia ya está activada en otro dispositivo. Contacta soporte para transferir la licencia.',
+            })
+          }
+        }
+      } else if (deviceFingerprint !== empresa.device_fingerprint) {
+        return json(res, 403, {
+          success: false,
+          code: 'DEVICE_MISMATCH',
+          error: 'Dispositivo no autorizado',
+          message: 'Esta licencia ya está activada en otro dispositivo. Contacta soporte para transferir la licencia.',
+        })
+      }
+    }
+
     const licencia = getActiveLicense(empresa.id)
     if (!licencia) {
       const sub = db.prepare('SELECT estado FROM suscripciones WHERE empresa_id = ? ORDER BY id DESC LIMIT 1').get(empresa.id)

@@ -253,3 +253,150 @@ test('rutas desconocidas devuelven 404', async () => {
   const res = await fetch(base + '/api/no-existe')
   assert.equal(res.status, 404)
 })
+
+// --- Licencia de un solo dispositivo (OmniServ) ---
+
+const TELEFONO_A = 'a'.repeat(64)
+const TELEFONO_B = 'b'.repeat(64)
+let empresaOmniserv = null // { id, api_key }
+
+function registerEmpresa(body) {
+  return post('/api/empresas/register', body)
+}
+
+function licenciaConFingerprint(empresaId, apiKey, fingerprint) {
+  const headers = { 'x-api-key': apiKey }
+  if (fingerprint) headers['x-device-fingerprint'] = fingerprint
+  return fetch(base + `/api/empresas/${empresaId}/licencia`, { headers })
+}
+
+test('registro desde la app: device_fingerprint es requerido y queda vinculado', async () => {
+  const sinFp = await registerEmpresa({
+    nombre: 'Kiosco Doña Rosa', pais: 'VE', documento: 'V-11222333',
+    email_contacto: 'rosa@kiosco.com',
+  })
+  assert.equal(sinFp.status, 400)
+  assert.match(sinFp.json.error, /device_fingerprint/i)
+
+  const ok = await registerEmpresa({
+    nombre: 'Kiosco Doña Rosa', pais: 'VE', documento: 'V-11222333',
+    email_contacto: 'rosa@kiosco.com', device_fingerprint: TELEFONO_A,
+  })
+  assert.equal(ok.status, 201)
+  assert.ok(ok.json.data.api_key)
+  empresaOmniserv = { id: ok.json.data.id, api_key: ok.json.data.api_key }
+})
+
+// Se emite licencia a la empresa de OmniServ para los tests siguientes
+// (el flujo Crixto automático lo hace al confirmar el pago)
+test('setup: emisión manual de licencia para la empresa OmniServ', async () => {
+  const res = await post(
+    `/api/empresas/${empresaOmniserv.id}/licencias`,
+    { cliente: 'Kiosco Doña Rosa', expira: '2099-12-31', modules: ['omniserv'] },
+    adminHeaders,
+  )
+  assert.equal(res.status, 201)
+})
+
+test('mismo país+documento desde otro teléfono → 403 DEVICE_MISMATCH (no revela api_key)', async () => {
+  const otroTelefono = await registerEmpresa({
+    nombre: 'Kiosco Doña Rosa', pais: 'VE', documento: 'V-11222333',
+    email_contacto: 'rosa@kiosco.com', device_fingerprint: TELEFONO_B,
+  })
+  assert.equal(otroTelefono.status, 403)
+  assert.equal(otroTelefono.json.code, 'DEVICE_MISMATCH')
+  assert.equal(otroTelefono.json.api_key, undefined)
+})
+
+test('mismo teléfono (reinstalación de la app) → recupera su registro', async () => {
+  const mismo = await registerEmpresa({
+    nombre: 'Kiosco Doña Rosa', pais: 'VE', documento: 'V-11222333',
+    email_contacto: 'rosa@kiosco.com', device_fingerprint: TELEFONO_A,
+  })
+  assert.equal(mismo.status, 200)
+  assert.equal(mismo.json.already_registered, true)
+  assert.equal(mismo.json.data.api_key, empresaOmniserv.api_key)
+})
+
+test('GET /licencia: fingerprint correcto → 200, incorrecto → 403', async () => {
+  const ok = await licenciaConFingerprint(empresaOmniserv.id, empresaOmniserv.api_key, TELEFONO_A)
+  assert.equal(ok.status, 200)
+  const { licencia } = await ok.json()
+  assert.deepEqual(licencia.modules, ['omniserv'])
+
+  const otra = await licenciaConFingerprint(empresaOmniserv.id, empresaOmniserv.api_key, TELEFONO_B)
+  assert.equal(otra.status, 403)
+  assert.equal((await otra.json()).code, 'DEVICE_MISMATCH')
+})
+
+test('GET /licencia sin header sigue funcionando (TOG Admin no envía fingerprint)', async () => {
+  const res = await fetch(base + `/api/empresas/${empresaOmniserv.id}/licencia`, {
+    headers: { 'x-api-key': empresaOmniserv.api_key },
+  })
+  assert.equal(res.status, 200)
+})
+
+test('primer dispositivo que reclama la licencia queda vinculado', async () => {
+  // Empresa creada por admin (flujo TOG Admin clásico): sin fingerprint aún
+  const creada = await post(
+    '/api/empresas',
+    { nombre: 'Solo Teléfono S.A.', pais: 'CO', documento: '900123456', email_contacto: 'solo@tel.co' },
+    adminHeaders,
+  )
+  assert.equal(creada.status, 201)
+  const nueva = { id: creada.json.id, api_key: creada.json.api_key }
+
+  const emision = await post(
+    `/api/empresas/${nueva.id}/licencias`,
+    { cliente: 'Solo Teléfono S.A.', expira: '2099-12-31', modules: ['omniserv'] },
+    adminHeaders,
+  )
+  assert.equal(emision.status, 201)
+
+  // Sin header aún no se vincula nada (compatible con tog-admin)
+  const sinHeader = await fetch(base + `/api/empresas/${nueva.id}/licencia`, {
+    headers: { 'x-api-key': nueva.api_key },
+  })
+  assert.equal(sinHeader.status, 200)
+
+  // Primer teléfono que la reclama: queda vinculado
+  const primero = await licenciaConFingerprint(nueva.id, nueva.api_key, TELEFONO_A)
+  assert.equal(primero.status, 200)
+
+  // Otro teléfono con la misma api_key: rechazado
+  const segundo = await licenciaConFingerprint(nueva.id, nueva.api_key, TELEFONO_B)
+  assert.equal(segundo.status, 403)
+  assert.equal((await segundo.json()).code, 'DEVICE_MISMATCH')
+})
+
+test('transferencia de dispositivo: admin desvincula y el nuevo teléfono queda vinculado', async () => {
+  const desvincular = await post(
+    `/api/admin/empresas/${empresaOmniserv.id}/dispositivo`,
+    { device_fingerprint: null },
+    adminHeaders,
+  )
+  assert.equal(desvincular.status, 200)
+  assert.equal(desvincular.json.device_fingerprint, null)
+
+  // El teléfono B (antes rechazado) ahora puede reclamar la licencia
+  const nuevo = await licenciaConFingerprint(empresaOmniserv.id, empresaOmniserv.api_key, TELEFONO_B)
+  assert.equal(nuevo.status, 200)
+
+  // Y el teléfono A (el anterior) queda rechazado
+  const viejo = await licenciaConFingerprint(empresaOmniserv.id, empresaOmniserv.api_key, TELEFONO_A)
+  assert.equal(viejo.status, 403)
+
+  // La transferencia requiere admin
+  const sinAdmin = await post(`/api/admin/empresas/${empresaOmniserv.id}/dispositivo`, { device_fingerprint: null })
+  assert.equal(sinAdmin.status, 401)
+})
+
+test('payment-status usa la empresa autenticada por api_key, no el id de la URL', async () => {
+  const res = await fetch(base + `/api/empresas/${empresaOmniserv.id}/payment-status`, {
+    headers: { 'x-api-key': empresa.api_key },
+  })
+  assert.equal(res.status, 200)
+  const body = await res.json()
+  // empresa (AgroMaíz) no tiene pago confirmado aunque la URL apunte a otra empresa
+  assert.equal(body.payment_confirmed, false)
+})
