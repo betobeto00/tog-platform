@@ -738,6 +738,33 @@ async function handle(req, res) {
     })
   }
 
+  // POST /api/payment/omniserv-payment — crea pago pendiente de OmniServ ($3/mes)
+  // y devuelve el monto + URL de retorno para el form de Crixto.
+  if (method === 'POST' && path === '/api/payment/omniserv-payment') {
+    const user = requireUser(req, res)
+    if (!user) return
+    const empresa = user.empresa_id ? db.prepare('SELECT * FROM empresas WHERE id = ?').get(user.empresa_id) : null
+    if (!empresa) return json(res, 400, { success: false, error: 'Vincula tu cuenta a una empresa (país + documento) para comprar' })
+
+    const monto = 3
+    const desglose = [{ modulo: 'OmniServ — mensual', precio: monto }]
+
+    const result = db
+      .prepare("INSERT INTO pagos (user_id, empresa_id, concepto, detalle, monto, moneda, estado, provider) VALUES (?, ?, ?, ?, ?, 'USD', 'pending', 'crixto')")
+      .run(user.id, empresa.id, 'omniserv:mensual', JSON.stringify({ producto: 'omniserv', periodo: 'mensual', modulos: ['omniserv'], desglose }), monto)
+    const pagoId = result.lastInsertRowid
+
+    const successUrl = `${req.headers.host ? 'https://' + req.headers.host : 'http://localhost:3001'}/api/payment/confirm?payment_id=${pagoId}`
+    return json(res, 201, {
+      success: true,
+      payment_id: pagoId,
+      monto,
+      moneda: 'USD',
+      success_url: successUrl,
+      cancel_url: 'https://omnimargen.site/precios?pago=cancelado',
+    })
+  }
+
   // GET /api/pagos/:id/factura — recibo/factura HTML imprimible
   const facturaMatch = path.match(/^\/api\/pagos\/(\d+)\/factura$/)
   if (method === 'GET' && facturaMatch) {
