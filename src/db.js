@@ -17,6 +17,7 @@ if (isPostgres) {
   })
   const schema = readFileSync(join(__dirname, 'schema.sql'), 'utf8')
     .replace(/INTEGER PRIMARY KEY AUTOINCREMENT/g, 'SERIAL PRIMARY KEY')
+    .replace(/datetime\('now'\)/g, 'NOW()')
   await pool.query(schema)
 } else {
   const { DatabaseSync } = await import('node:sqlite')
