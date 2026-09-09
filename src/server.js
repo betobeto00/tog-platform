@@ -10,6 +10,8 @@ const ADMIN_API_KEY = process.env.ADMIN_API_KEY || 'dev-admin-key'
 const PRIVATE_KEY_PATH = process.env.LICENSE_PRIVATE_KEY_PATH || './keys/private.key'
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || ''
 const STRIPE_DOMAIN = (process.env.STRIPE_DOMAIN || `http://localhost:${PORT}`).replace(/\/+$/, '')
+const RESEND_API_KEY = process.env.RESEND_API_KEY || ''
+const INVOICE_FROM = process.env.INVOICE_FROM || 'OmniMargen <facturas@omnimargen.site>'
 // Módulos que se pueden comprar por suscripción (el Comercializador es la base)
 const MODULOS_COMPRABLES = MODULE_IDS.filter((m) => m !== 'comercializador')
 
@@ -288,6 +290,34 @@ function htmlFactura(pago, empresa, user) {
 </body></html>`
 }
 
+// Envía la factura por email vía Resend. Silencioso: no falla el flujo de pago
+// si el email no se puede enviar (se loguea y sigue).
+async function sendInvoiceEmail(pago, empresa, user) {
+  if (!RESEND_API_KEY) return
+  const emailDestino = user?.email || empresa?.email_contacto
+  if (!emailDestino) return
+  const html = htmlFactura(pago, empresa, user)
+  const conceptoLabel = pago.concepto === 'omniserv:mensual' ? 'OmniServ' : 'TOG Admin'
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: INVOICE_FROM,
+        to: [emailDestino],
+        subject: `Factura ${pago.nro_factura} — ${conceptoLabel} · OmniMargen`,
+        html,
+      }),
+    })
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '')
+      console.error(`[email] Resend ${res.status}: ${detail}`)
+    }
+  } catch (err) {
+    console.error('[email] Error enviando factura:', err?.message || err)
+  }
+}
+
 // Grace period vencido sin pago → 'cancelado_impago' y revocación de la licencia.
 // Se ejecuta antes de servir una licencia (y en cada webhook) para no depender
 // de un cron.
@@ -519,6 +549,9 @@ async function handle(req, res) {
           if (privateKey) {
             emitirLicenciaConModulos(empresa, { modulos, por: `crixto:${pago.id}`, meses })
           }
+          const pagoConfirmado = db.prepare('SELECT * FROM pagos WHERE id = ?').get(pago.id)
+          const user = pago.user_id ? db.prepare('SELECT * FROM users WHERE id = ?').get(pago.user_id) : null
+          sendInvoiceEmail(pagoConfirmado, empresa, user)
           res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
           res.end(
             paginaSimple(
@@ -542,9 +575,12 @@ async function handle(req, res) {
           emitirLicencia(empresa, { modulo: 'omniserv', por: 'crixto:auto', meses: 1 })
         }
         if (empresa) {
-          db.prepare(
+          const result = db.prepare(
             "INSERT INTO pagos (user_id, empresa_id, concepto, detalle, monto, moneda, estado, provider, nro_factura, paid_at) VALUES (NULL, ?, 'omniserv:mensual', ?, 3, 'USD', 'confirmed', 'crixto', ?, datetime('now'))"
           ).run(empresa.id, JSON.stringify({ producto: 'omniserv', periodo: 'mensual', modulos: ['omniserv'], desglose: [{ modulo: 'OmniServ — mensual', precio: 3 }] }), generarNroFactura())
+          const pago = db.prepare('SELECT * FROM pagos WHERE id = ?').get(result.lastInsertRowid)
+          const user = db.prepare('SELECT * FROM users WHERE empresa_id = ?').get(empresa.id)
+          sendInvoiceEmail(pago, empresa, user)
         }
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
         res.end(paginaSimple('✅ Pago Confirmado', 'Tu licencia ha sido activada. Vuelve a la app y presiona "Verificar Pago".'))
