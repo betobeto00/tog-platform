@@ -15,6 +15,9 @@ if (isPostgres) {
     connectionString: process.env.DATABASE_URL,
     ssl: process.env.DATABASE_URL?.includes('supabase') ? { rejectUnauthorized: false } : false,
   })
+  const schema = readFileSync(join(__dirname, 'schema.sql'), 'utf8')
+    .replace(/INTEGER PRIMARY KEY AUTOINCREMENT/g, 'SERIAL PRIMARY KEY')
+  await pool.query(schema)
 } else {
   const { DatabaseSync } = await import('node:sqlite')
   const { mkdirSync } = await import('node:fs')
