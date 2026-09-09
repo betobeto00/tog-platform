@@ -686,7 +686,7 @@ async function handle(req, res) {
     } else {
       console.log(`[forgot] USER NOT FOUND email=${email}`)
     }
-    return json(res, 200, { success: true, message: 'Si el email existe, recibirás un enlace para restablecer tu contraseña.' })
+    return json(res, 200, { success: true, email_exists: !!user, message: 'Si el email existe, recibirás un enlace para restablecer tu contraseña.' })
   }
 
   // POST /api/auth/reset-password — cambia la contraseña con el token válido
