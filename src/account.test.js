@@ -216,3 +216,32 @@ test('confirm sin parámetros: página genérica de éxito (URL fija del panel d
   assert.equal(res.status, 200)
   assert.match(res.text, /Pago exitoso/)
 })
+
+test('forgot + reset-password: cambia la contraseña con un token válido', async () => {
+  const token = 'reset-' + crypto.randomBytes(16).toString('hex')
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex')
+
+  const forgot = await post('/api/auth/forgot', { email: cuenta.email, token_hash: tokenHash })
+  assert.equal(forgot.status, 200)
+
+  const malFormato = await post('/api/auth/forgot', { email: cuenta.email, token_hash: 'no-es-hash' })
+  assert.equal(malFormato.status, 400)
+
+  const tokenInvalido = await post('/api/auth/reset-password', { token: 'no-existe', password: 'NuevaPass123' })
+  assert.equal(tokenInvalido.status, 400)
+
+  const passwordCorta = await post('/api/auth/reset-password', { token, password: '123' })
+  assert.equal(passwordCorta.status, 400)
+
+  const ok = await post('/api/auth/reset-password', { token, password: 'NuevaPass123' })
+  assert.equal(ok.status, 200)
+
+  const reusado = await post('/api/auth/reset-password', { token, password: 'OtraPass123' })
+  assert.equal(reusado.status, 400, 'el token ya no debe servir')
+
+  const nuevoLogin = await post('/api/auth/login', { email: cuenta.email, password: 'NuevaPass123' })
+  assert.equal(nuevoLogin.status, 200)
+
+  const emailInexistente = await post('/api/auth/forgot', { email: 'nadie@x.com', token_hash: 'a'.repeat(64) })
+  assert.equal(emailInexistente.status, 200, 'respuesta genérica para no revelar si el email existe')
+})

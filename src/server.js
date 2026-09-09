@@ -619,6 +619,58 @@ async function handle(req, res) {
     return json(res, 200, { success: true, token: signToken({ uid: user.id }), user: publico })
   }
 
+  // POST /api/auth/forgot — guarda el hash del token de recuperación que
+  // generó el emisor del email (la landing). Respuesta genérica para no
+  // revelar si el email existe. Expiración por defecto: 1 hora.
+  if (method === 'POST' && path === '/api/auth/forgot') {
+    const body = await readBody(req)
+    const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : ''
+    const tokenHash = typeof body?.token_hash === 'string' ? body.token_hash.trim() : ''
+    if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) || !/^[a-f0-9]{64}$/.test(tokenHash)) {
+      return json(res, 400, { success: false, error: 'email y token_hash (sha256 hex) son requeridos' })
+    }
+    const user = db.prepare('SELECT id FROM users WHERE email = ?').get(email)
+    if (user) {
+      const expira = new Date(Date.now() + 60 * 60 * 1000).toISOString()
+      db.exec('BEGIN')
+      try {
+        db.prepare('UPDATE password_resets SET usado = 1 WHERE user_id = ?').run(user.id)
+        db.prepare('INSERT INTO password_resets (user_id, token_hash, expira) VALUES (?, ?, ?)').run(user.id, tokenHash, expira)
+        db.exec('COMMIT')
+      } catch (err) {
+        try {
+          db.exec('ROLLBACK')
+        } catch {
+          // sin transacción activa
+        }
+        throw err
+      }
+    }
+    return json(res, 200, { success: true, message: 'Si el email existe, recibirás un enlace para restablecer tu contraseña.' })
+  }
+
+  // POST /api/auth/reset-password — cambia la contraseña con el token válido
+  if (method === 'POST' && path === '/api/auth/reset-password') {
+    const body = await readBody(req)
+    const token = typeof body?.token === 'string' ? body.token.trim() : ''
+    const password = typeof body?.password === 'string' ? body.password : ''
+    if (!token) return json(res, 400, { success: false, error: 'Token requerido' })
+    if (password.length < 6) {
+      return json(res, 400, { success: false, error: 'La contraseña debe tener al menos 6 caracteres' })
+    }
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex')
+    const row = db.prepare('SELECT id, user_id, expira, usado FROM password_resets WHERE token_hash = ?').get(tokenHash)
+    if (!row || row.usado === 1) {
+      return json(res, 400, { success: false, error: 'Token inválido o ya utilizado' })
+    }
+    if (new Date(row.expira).getTime() < Date.now()) {
+      return json(res, 400, { success: false, error: 'Token expirado. Solicita un nuevo enlace.' })
+    }
+    db.prepare('UPDATE users SET password_hash = ?, updated_at = datetime(\'now\') WHERE id = ?').run(hashPassword(password), row.user_id)
+    db.prepare('UPDATE password_resets SET usado = 1 WHERE id = ?').run(row.id)
+    return json(res, 200, { success: true, message: 'Contraseña actualizada. Ya puedes iniciar sesión.' })
+  }
+
   // GET /api/user/profile — datos de la cuenta, empresa vinculada, licencia y pagos
   if (method === 'GET' && path === '/api/user/profile') {
     const user = requireUser(req, res)

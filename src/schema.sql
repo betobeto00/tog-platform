@@ -73,6 +73,17 @@ CREATE TABLE IF NOT EXISTS users (
   updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Tokens de recuperación de contraseña (el hash del token lo genera el
+-- emisor del email — la landing —; el backend solo valida el hash).
+CREATE TABLE IF NOT EXISTS password_resets (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id    INTEGER NOT NULL REFERENCES users(id),
+  token_hash TEXT UNIQUE NOT NULL,
+  expira     TEXT NOT NULL,
+  usado      INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- Pagos online (CRIXTO) y facturas generadas tras la confirmación.
 -- user_id puede ser NULL (flujo OmniServ, que confirma por empresa).
 CREATE TABLE IF NOT EXISTS pagos (
