@@ -670,9 +670,10 @@ async function handle(req, res) {
       const expira = new Date(Date.now() + 60 * 60 * 1000).toISOString()
       db.exec('BEGIN')
       try {
-        db.prepare('UPDATE password_resets SET usado = 1 WHERE user_id = ?').run(user.id)
-        db.prepare('INSERT INTO password_resets (user_id, token_hash, expira) VALUES (?, ?, ?)').run(user.id, tokenHash, expira)
-        db.exec('COMMIT')
+      db.prepare('UPDATE password_resets SET usado = 1 WHERE user_id = ?').run(user.id)
+      db.prepare('INSERT INTO password_resets (user_id, token_hash, expira) VALUES (?, ?, ?)').run(user.id, tokenHash, expira)
+      console.log(`[forgot] user=${user.id} email=${email} hash=${tokenHash.slice(0, 8)}… expires=${expira}`)
+      db.exec('COMMIT')
       } catch (err) {
         try {
           db.exec('ROLLBACK')
@@ -696,6 +697,7 @@ async function handle(req, res) {
     }
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex')
     const row = db.prepare('SELECT id, user_id, expira, usado FROM password_resets WHERE token_hash = ?').get(tokenHash)
+    console.log(`[reset] token_len=${token.length} hash=${tokenHash.slice(0, 8)}… found=${!!row} usado=${row?.usado} expira=${row?.expira}`)
     if (!row || row.usado === 1) {
       return json(res, 400, { success: false, error: 'Token inválido o ya utilizado' })
     }
