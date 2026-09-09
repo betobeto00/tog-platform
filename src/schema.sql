@@ -58,5 +58,41 @@ CREATE TABLE IF NOT EXISTS webhook_events (
   procesado_en    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Usuarios de la cuenta web (landing /cuenta): login con email + contraseña.
+-- Se vinculan a una empresa existente (pais + documento) o crean una nueva.
+CREATE TABLE IF NOT EXISTS users (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  email         TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  nombre        TEXT NOT NULL,
+  pais          TEXT NOT NULL DEFAULT 'VE',
+  documento     TEXT NOT NULL DEFAULT '',
+  telefono      TEXT,
+  empresa_id    INTEGER REFERENCES empresas(id),
+  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Pagos online (CRIXTO) y facturas generadas tras la confirmación.
+-- user_id puede ser NULL (flujo OmniServ, que confirma por empresa).
+CREATE TABLE IF NOT EXISTS pagos (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id     INTEGER REFERENCES users(id),
+  empresa_id  INTEGER NOT NULL REFERENCES empresas(id),
+  concepto    TEXT NOT NULL,                   -- 'tog:mensual' | 'tog:trimestral' | 'tog:anual' | 'omniserv:mensual'
+  detalle     TEXT NOT NULL DEFAULT '[]',      -- JSON con módulos/periodo/desglose del carrito
+  monto       REAL NOT NULL,
+  moneda      TEXT NOT NULL DEFAULT 'USD',
+  estado      TEXT NOT NULL DEFAULT 'pending', -- pending | confirmed | cancelled
+  provider    TEXT NOT NULL DEFAULT 'crixto',
+  provider_ref TEXT,
+  nro_factura TEXT UNIQUE,
+  paid_at     TEXT,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_pagos_user ON pagos(user_id);
+CREATE INDEX IF NOT EXISTS idx_pagos_empresa ON pagos(empresa_id);
+CREATE INDEX IF NOT EXISTS idx_pagos_estado ON pagos(estado);
 CREATE INDEX IF NOT EXISTS idx_licencias_empresa ON licencias(empresa_id);
 CREATE INDEX IF NOT EXISTS idx_licencias_activa ON licencias(empresa_id, revoked_at, expires_at);

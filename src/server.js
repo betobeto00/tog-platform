@@ -98,6 +98,88 @@ function requireEmpresa(req, res) {
   return empresa
 }
 
+// ---------- cuenta web: password (scrypt) + tokens (HMAC-SHA256) ----------
+// Cero dependencias: scrypt y HMAC son módulos built-in de node:crypto.
+
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-jwt-secret'
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex')
+  const hash = crypto.scryptSync(password, salt, 64).toString('hex')
+  return `scrypt$${salt}$${hash}`
+}
+
+function verifyPassword(password, stored) {
+  const [algo, salt, hash] = String(stored || '').split('$')
+  if (algo !== 'scrypt' || !salt || !hash) return false
+  const candidate = crypto.scryptSync(password, salt, 64).toString('hex')
+  return crypto.timingSafeEqual(Buffer.from(candidate, 'hex'), Buffer.from(hash, 'hex'))
+}
+
+function b64url(buf) {
+  return Buffer.from(buf).toString('base64url')
+}
+
+function signToken(payload, expiresInSec = 7 * 24 * 3600) {
+  const header = b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))
+  const body = b64url(JSON.stringify({ ...payload, exp: Math.floor(Date.now() / 1000) + expiresInSec }))
+  const signature = crypto.createHmac('sha256', JWT_SECRET).update(`${header}.${body}`).digest('base64url')
+  return `${header}.${body}.${signature}`
+}
+
+function verifyToken(token) {
+  if (typeof token !== 'string') return null
+  const [header, body, signature] = token.split('.')
+  if (!header || !body || !signature) return null
+  const expected = crypto.createHmac('sha256', JWT_SECRET).update(`${header}.${body}`).digest('base64url')
+  if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return null
+  try {
+    const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'))
+    if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) return null
+    return payload
+  } catch {
+    return null
+  }
+}
+
+function requireUser(req, res) {
+  const auth = req.headers['authorization'] || ''
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : ''
+  const payload = verifyToken(token)
+  if (!payload?.uid) {
+    json(res, 401, { success: false, error: 'Token inválido o expirado' })
+    return null
+  }
+  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(payload.uid)
+  if (!user) {
+    json(res, 401, { success: false, error: 'Usuario no encontrado' })
+    return null
+  }
+  return user
+}
+
+// ---------- precios del carrito de compras ----------
+// TOG base: 15$/mes · 40$/3 meses · 150$/año. Cada módulo adicional +3$/mes.
+// OmniServ: 3$/mes (botón único, no pasa por el carrito).
+
+const PRECIOS_TOG = { mensual: 15, trimestral: 40, anual: 150 }
+const EXTRA_MODULO_MENSUAL = 3
+const MESES_POR_PERIODO = { mensual: 1, trimestral: 3, anual: 12 }
+// Módulos vendibles como extra sobre la base Comercializador (en orden canónico)
+const MODULOS_EXTRA = MODULE_IDS.filter((m) => m !== 'comercializador' && m !== 'omniserv')
+
+function precioModulosExtra(periodo, modulos) {
+  const meses = MESES_POR_PERIODO[periodo] || 1
+  return modulos.length * EXTRA_MODULO_MENSUAL * meses
+}
+
+function totalCarrito(periodo, modulos) {
+  const base = PRECIOS_TOG[periodo]
+  if (!base) return null
+  const extras = precioModulosExtra(periodo, modulos)
+  return base + extras
+}
+
 // ---------- rutas ----------
 
 function paginaSimple(title, body) {
@@ -121,10 +203,11 @@ function moduloDePriceId(priceId) {
   return MODULOS_COMPRABLES.find((m) => priceIdFor(m) === priceId) || null
 }
 
-// Emite (o renueva) la licencia de una empresa sumando/renovando un módulo.
-function emitirLicencia(empresa, { modulo, por, meses = 1 }) {
+// Emite (o renueva) la licencia de una empresa con un conjunto de módulos
+// (suma a los acumulados de la última licencia, preservando compras previas).
+function emitirLicenciaConModulos(empresa, { modulos, por, meses = 1 }) {
   if (!privateKey) throw new Error('Clave privada no configurada para firmar la licencia')
-  const conjunto = new Set([...modulosDeUltimaLicencia(empresa.id), modulo])
+  const conjunto = new Set([...modulosDeUltimaLicencia(empresa.id), ...modulos])
   const ordenados = MODULE_IDS.filter((m) => conjunto.has(m))
   const license = signLicense(privateKey, {
     cliente: empresa.nombre,
@@ -137,6 +220,72 @@ function emitirLicencia(empresa, { modulo, por, meses = 1 }) {
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(empresa.id, JSON.stringify(license.modules || []), 1, 1, license.emitida, license.expira, JSON.stringify(license), por)
   return license
+}
+
+// Compatibilidad: emite sumando un solo módulo (flujo Stripe y Crixto OmniServ).
+function emitirLicencia(empresa, { modulo, por, meses = 1 }) {
+  return emitirLicenciaConModulos(empresa, { modulos: [modulo], por, meses })
+}
+
+// ---------- facturas / recibos ----------
+
+// Número de factura secuencial por año: F-2026-0001, F-2026-0002, …
+function generarNroFactura() {
+  const year = new Date().getFullYear()
+  const row = db
+    .prepare("SELECT COUNT(*) AS n FROM pagos WHERE nro_factura IS NOT NULL AND substr(nro_factura, 3, 4) = ?")
+    .get(String(year))
+  const siguiente = Number(row?.n || 0) + 1
+  return `F-${year}-${String(siguiente).padStart(4, '0')}`
+}
+
+// HTML autocontenido e imprimible del recibo/factura de un pago confirmado.
+function htmlFactura(pago, empresa, user) {
+  let detalle = {}
+  try {
+    detalle = JSON.parse(pago.detalle || '{}')
+  } catch {
+    detalle = {}
+  }
+  const lineas = Array.isArray(detalle.desglose) ? detalle.desglose : []
+  const periodo = detalle.periodo || pago.concepto.split(':')[1] || ''
+  const fecha = new Date(pago.paid_at || pago.created_at).toLocaleString('es-VE', { timeZone: 'UTC' })
+  const conceptoLabel = pago.concepto === 'omniserv:mensual' ? 'OmniServ — Suscripción mensual' : 'TOG Admin — Suscripción '
+  const filas = lineas
+    .map((l) => `<tr><td>${l.modulo}</td><td style="text-align:right">$${Number(l.precio).toFixed(2)}</td></tr>`)
+    .join('')
+  return `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Factura ${pago.nro_factura} — OmniMargen</title>
+  <style>
+    body{font-family:Segoe UI,Arial,sans-serif;color:#111;max-width:720px;margin:24px auto;padding:0 16px}
+    h1{font-size:22px;margin:0 0 4px}.muted{color:#666;font-size:13px}
+    table{width:100%;border-collapse:collapse;margin:16px 0}
+    th,td{padding:8px 10px;border-bottom:1px solid #ddd;text-align:left;font-size:14px}
+    th{background:#f5f7fa}
+    .total td{font-weight:700;font-size:16px;border-top:2px solid #333;border-bottom:none}
+    .box{border:1px solid #ddd;border-radius:8px;padding:12px 16px;margin:12px 0}
+    .badge{display:inline-block;background:#16a34a;color:#fff;padding:4px 12px;border-radius:999px;font-size:13px;font-weight:600}
+    footer{margin-top:32px;font-size:12px;color:#888;text-align:center}
+    @media print{body{margin:0}.noprint{display:none}}
+  </style></head><body>
+  <h1>🧾 OmniMargen</h1>
+  <p class="muted">Factura y recibo de pago · ${conceptoLabel}${periodo}</p>
+  <div class="box">
+    <p><strong>Factura N°:</strong> ${pago.nro_factura}</p>
+    <p><strong>Fecha de pago:</strong> ${fecha}</p>
+    <p><strong>Cliente:</strong> ${empresa.nombre} (${empresa.pais} · ${empresa.documento})</p>
+    ${user?.email ? `<p><strong>Email:</strong> ${user.email}</p>` : `<p><strong>Email:</strong> ${empresa.email_contacto}</p>`}
+    <p><strong>Método de pago:</strong> CRIXTO · <strong>Estado:</strong> <span class="badge">PAGADO</span></p>
+    ${pago.provider_ref ? `<p><strong>Referencia:</strong> ${pago.provider_ref}</p>` : ''}
+  </div>
+  <table>
+    <thead><tr><th>Concepto</th><th style="text-align:right">Monto</th></tr></thead>
+    <tbody>${filas}</tbody>
+    <tr class="total"><td>Total</td><td style="text-align:right">$${Number(pago.monto).toFixed(2)} ${pago.moneda}</td></tr>
+  </table>
+  <p class="muted">Precios en USD. Impuestos según la legislación de tu país.</p>
+  <footer>OmniMargen — omnimargen.site · soporte@omnimargen.site</footer>
+  <p class="noprint" style="margin-top:16px"><a href="javascript:window.print()">Imprimir / guardar PDF</a></p>
+</body></html>`
 }
 
 // Grace period vencido sin pago → 'cancelado_impago' y revocación de la licencia.
@@ -331,31 +480,225 @@ async function handle(req, res) {
     }
   }
 
-  // GET /api/payment/confirm — confirmación de pago desde Crixto
+  // GET /api/payment/confirm — confirmación de pago desde Crixto.
+  // 1) ?payment_id=X (carrito TOG desde la landing) → confirma ese pago, emite
+  //    la licencia con los módulos del carrito y genera la factura.
+  // 2) ?empresa_id=X (deep link OmniServ) → flujo histórico: marca el pago de
+  //    la empresa y emite licencia omniserv (1 mes).
+  // 3) sin parámetros (URL fija del panel de Crixto) → página genérica de éxito.
   if (method === 'GET' && path === '/api/payment/confirm') {
+    const paymentId = url.searchParams.get('payment_id')
     const empresaId = url.searchParams.get('empresa_id')
-    if (!empresaId) {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-      res.end(paginaSimple('Error', 'Falta el ID de empresa'))
-      return
-    }
+    const extra = [...url.searchParams.entries()].filter(([k]) => k !== 'payment_id' && k !== 'empresa_id')
+    const providerRef = extra.length ? extra.map(([k, v]) => `${k}=${v}`).join('&') : null
 
     try {
-      db.prepare('UPDATE empresas SET payment_status = ?, payment_confirmed_at = datetime(\'now\') WHERE id = ?')
-        .run('confirmed', Number(empresaId))
-      
-      // Emitir licencia automática (1 mes para suscripción mensual)
-      const empresa = db.prepare('SELECT * FROM empresas WHERE id = ?').get(Number(empresaId))
-      if (empresa && privateKey) {
-        emitirLicencia(empresa, { modulo: 'omniserv', por: 'crixto:auto', meses: 1 })
+      // Carrito TOG: confirmar el pago exacto (idempotente)
+      if (paymentId) {
+        const pago = db.prepare('SELECT * FROM pagos WHERE id = ?').get(Number(paymentId))
+        if (!pago) {
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+          res.end(paginaSimple('Error', 'Pago no encontrado'))
+          return
+        }
+        const empresa = db.prepare('SELECT * FROM empresas WHERE id = ?').get(pago.empresa_id)
+        if (!empresa) throw new Error('Empresa del pago no encontrada')
+        if (pago.estado !== 'confirmed') {
+          const nroFactura = generarNroFactura()
+          db.prepare("UPDATE pagos SET estado = 'confirmed', paid_at = datetime('now'), nro_factura = ?, provider_ref = COALESCE(?, provider_ref) WHERE id = ?")
+            .run(nroFactura, providerRef, pago.id)
+          const detalle = (() => {
+            try {
+              return JSON.parse(pago.detalle || '{}')
+            } catch {
+              return {}
+            }
+          })()
+          const modulos = Array.isArray(detalle.modulos) && detalle.modulos.length ? detalle.modulos : ['comercializador']
+          const meses = MESES_POR_PERIODO[detalle.periodo] || 1
+          if (privateKey) {
+            emitirLicenciaConModulos(empresa, { modulos, por: `crixto:${pago.id}`, meses })
+          }
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+          res.end(
+            paginaSimple(
+              '✅ Pago Confirmado',
+              `Tu licencia fue activada (factura ${nroFactura}). <a href="/api/pagos/${pago.id}/factura">Ver recibo y factura</a> · vuelve a <a href="https://omnimargen.site/cuenta">tu cuenta</a>.`,
+            ),
+          )
+        } else {
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+          res.end(paginaSimple('✅ Pago Confirmado', 'Este pago ya había sido confirmado.'))
+        }
+        return
       }
 
+      // OmniServ (deep link con empresa_id): mantener el flujo histórico
+      if (empresaId) {
+        db.prepare("UPDATE empresas SET payment_status = 'confirmed', payment_confirmed_at = datetime('now') WHERE id = ?")
+          .run(Number(empresaId))
+        const empresa = db.prepare('SELECT * FROM empresas WHERE id = ?').get(Number(empresaId))
+        if (empresa && privateKey) {
+          emitirLicencia(empresa, { modulo: 'omniserv', por: 'crixto:auto', meses: 1 })
+        }
+        if (empresa) {
+          db.prepare(
+            "INSERT INTO pagos (user_id, empresa_id, concepto, detalle, monto, moneda, estado, provider, nro_factura, paid_at) VALUES (NULL, ?, 'omniserv:mensual', ?, 3, 'USD', 'confirmed', 'crixto', ?, datetime('now'))"
+          ).run(empresa.id, JSON.stringify({ producto: 'omniserv', periodo: 'mensual', modulos: ['omniserv'], desglose: [{ modulo: 'OmniServ — mensual', precio: 3 }] }), generarNroFactura())
+        }
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+        res.end(paginaSimple('✅ Pago Confirmado', 'Tu licencia ha sido activada. Vuelve a la app y presiona "Verificar Pago".'))
+        return
+      }
+
+      // URL fija del panel de Crixto: página genérica (la confirmación real la
+      // hace la landing vía el payment_id del formulario).
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-      res.end(paginaSimple('✅ Pago Confirmado', 'Tu licencia ha sido activada. Vuelve a la app y presiona "Verificar Pago".'))
+      res.end(paginaSimple('✅ Pago exitoso', 'Gracias por tu pago. Vuelve a <a href="https://omnimargen.site/cuenta">tu cuenta OmniMargen</a> para ver tus servicios activos y tus facturas.'))
+      return
     } catch (err) {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       res.end(paginaSimple('Error', 'Error al procesar el pago. Contacta soporte.'))
     }
+    return
+  }
+
+  // POST /api/auth/register — alta de cuenta web (email + contraseña).
+  // Crea/vincula la empresa por identidad internacional (pais + documento).
+  if (method === 'POST' && path === '/api/auth/register') {
+    const body = await readBody(req)
+    const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : ''
+    const password = typeof body?.password === 'string' ? body.password : ''
+    const nombre = typeof body?.nombre === 'string' ? body.nombre.trim() : ''
+    const pais = (typeof body?.pais === 'string' ? body.pais.trim().toUpperCase() : 'VE') || 'VE'
+    const documento = typeof body?.documento === 'string' ? body.documento.trim().toUpperCase() : ''
+    const telefono = typeof body?.telefono === 'string' ? body.telefono.trim() : ''
+
+    if (!email || !password || !nombre) {
+      return json(res, 400, { success: false, error: 'email, password y nombre son requeridos' })
+    }
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+      return json(res, 400, { success: false, error: 'Email inválido' })
+    }
+    if (password.length < 6) {
+      return json(res, 400, { success: false, error: 'La contraseña debe tener al menos 6 caracteres' })
+    }
+    if (db.prepare('SELECT id FROM users WHERE email = ?').get(email)) {
+      return json(res, 409, { success: false, error: 'Ya existe una cuenta con ese email' })
+    }
+
+    let empresa = null
+    if (documento) {
+      empresa = db.prepare('SELECT * FROM empresas WHERE pais = ? AND documento = ?').get(pais, documento)
+      if (!empresa) {
+        const apiKey = crypto.randomBytes(16).toString('hex')
+        const result = db
+          .prepare('INSERT INTO empresas (nombre, pais, documento, email_contacto, api_key) VALUES (?, ?, ?, ?, ?)')
+          .run(nombre, pais, documento, email, apiKey)
+        empresa = db.prepare('SELECT * FROM empresas WHERE id = ?').get(result.lastInsertRowid)
+      }
+    }
+
+    const result = db
+      .prepare('INSERT INTO users (email, password_hash, nombre, pais, documento, telefono, empresa_id) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(email, hashPassword(password), nombre, pais, documento, telefono || null, empresa?.id || null)
+    const user = db.prepare('SELECT id, email, nombre, pais, documento, telefono, empresa_id, created_at FROM users WHERE id = ?').get(result.lastInsertRowid)
+    return json(res, 201, { success: true, token: signToken({ uid: user.id }), user })
+  }
+
+  // POST /api/auth/login — iniciar sesión con email + contraseña
+  if (method === 'POST' && path === '/api/auth/login') {
+    const body = await readBody(req)
+    const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : ''
+    const password = typeof body?.password === 'string' ? body.password : ''
+    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email)
+    if (!user || !verifyPassword(password, user.password_hash)) {
+      return json(res, 401, { success: false, error: 'Email o contraseña incorrectos' })
+    }
+    const { password_hash, ...publico } = user
+    return json(res, 200, { success: true, token: signToken({ uid: user.id }), user: publico })
+  }
+
+  // GET /api/user/profile — datos de la cuenta, empresa vinculada, licencia y pagos
+  if (method === 'GET' && path === '/api/user/profile') {
+    const user = requireUser(req, res)
+    if (!user) return
+    const empresa = user.empresa_id ? db.prepare('SELECT * FROM empresas WHERE id = ?').get(user.empresa_id) : null
+    const licencia = empresa ? getActiveLicense(empresa.id) : null
+    const host = req.headers.host ? `https://${req.headers.host}` : ''
+    const pagos = db
+      .prepare('SELECT id, concepto, monto, moneda, estado, nro_factura, paid_at, created_at FROM pagos WHERE user_id = ? ORDER BY id DESC LIMIT 50')
+      .all(user.id)
+    const pagosConUrl = pagos.map((p) => ({
+      ...p,
+      factura_url: p.nro_factura ? `${host}/api/pagos/${p.id}/factura` : null,
+    }))
+    const { password_hash, ...publico } = user
+    return json(res, 200, {
+      success: true,
+      user: publico,
+      empresa: empresa ? { id: empresa.id, nombre: empresa.nombre, pais: empresa.pais, documento: empresa.documento, email_contacto: empresa.email_contacto, api_key: empresa.api_key } : null,
+      licencia_activa: licencia ? JSON.parse(licencia.payload_json) : null,
+      pagos: pagosConUrl,
+    })
+  }
+
+  // POST /api/payment/create — carrito CRIXTO: crea el pago y devuelve el monto
+  // y la URL de retorno (el formulario de la landing programa amount_cx con ese monto).
+  if (method === 'POST' && path === '/api/payment/create') {
+    const user = requireUser(req, res)
+    if (!user) return
+    const body = await readBody(req)
+    const periodo = body?.periodo
+    if (!PRECIOS_TOG[periodo]) {
+      return json(res, 400, { success: false, error: `periodo inválido. Disponibles: ${Object.keys(PRECIOS_TOG).join(', ')}` })
+    }
+    const modulosRaw = Array.isArray(body?.modulos) ? body.modulos.map((m) => String(m)) : []
+    const invalidos = modulosRaw.filter((m) => !MODULOS_EXTRA.includes(m))
+    if (invalidos.length) {
+      return json(res, 400, { success: false, error: `Módulo(s) desconocido(s): ${invalidos.join(', ')}` })
+    }
+    const modulos = [...new Set(modulosRaw)]
+    const monto = totalCarrito(periodo, modulos)
+    if (monto == null) return json(res, 400, { success: false, error: 'No se pudo calcular el monto del carrito' })
+
+    const empresa = user.empresa_id ? db.prepare('SELECT * FROM empresas WHERE id = ?').get(user.empresa_id) : null
+    if (!empresa) return json(res, 400, { success: false, error: 'Vincula tu cuenta a una empresa (país + documento) para comprar' })
+
+    const desglose = [{ modulo: `TOG Admin (base ${periodo})`, precio: PRECIOS_TOG[periodo] }]
+    for (const m of modulos) desglose.push({ modulo: `Módulo ${m}`, precio: EXTRA_MODULO_MENSUAL * MESES_POR_PERIODO[periodo] })
+
+    const result = db
+      .prepare("INSERT INTO pagos (user_id, empresa_id, concepto, detalle, monto, moneda, estado, provider) VALUES (?, ?, ?, ?, ?, 'USD', 'pending', 'crixto')")
+      .run(user.id, empresa.id, `tog:${periodo}`, JSON.stringify({ producto: 'tog', periodo, modulos: ['comercializador', ...modulos], desglose }), monto)
+    const pagoId = result.lastInsertRowid
+
+    const successUrl = `${req.headers.host ? 'https://' + req.headers.host : 'http://localhost:3001'}/api/payment/confirm?payment_id=${pagoId}`
+    return json(res, 201, {
+      success: true,
+      payment_id: pagoId,
+      monto,
+      moneda: 'USD',
+      periodo,
+      modulos: ['comercializador', ...modulos],
+      success_url: successUrl,
+      cancel_url: 'https://omnimargen.site/precios?pago=cancelado',
+    })
+  }
+
+  // GET /api/pagos/:id/factura — recibo/factura HTML imprimible
+  const facturaMatch = path.match(/^\/api\/pagos\/(\d+)\/factura$/)
+  if (method === 'GET' && facturaMatch) {
+    const pago = db.prepare('SELECT * FROM pagos WHERE id = ?').get(Number(facturaMatch[1]))
+    if (!pago || pago.estado !== 'confirmed') {
+      res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' })
+      res.end(paginaSimple('No encontrada', 'Esta factura no existe o el pago aún no fue confirmado.'))
+      return
+    }
+    const empresa = db.prepare('SELECT * FROM empresas WHERE id = ?').get(pago.empresa_id)
+    const user = pago.user_id ? db.prepare('SELECT * FROM users WHERE id = ?').get(pago.user_id) : null
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+    res.end(htmlFactura(pago, empresa, user))
     return
   }
 
