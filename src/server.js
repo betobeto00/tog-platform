@@ -1,7 +1,7 @@
 import http from 'node:http'
 import crypto from 'node:crypto'
 import { pathToFileURL } from 'node:url'
-import { db, getActiveLicense } from './db.js'
+import { db, getActiveLicense, closeDatabase, NOW } from './db.js'
 import { signLicense, loadPrivateKey, MODULE_IDS } from './sign.js'
 import { createCheckoutSession, createStripeCustomer, verifyStripeWebhook } from './stripe.js'
 
@@ -12,7 +12,6 @@ const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || ''
 const STRIPE_DOMAIN = (process.env.STRIPE_DOMAIN || `http://localhost:${PORT}`).replace(/\/+$/, '')
 const RESEND_API_KEY = process.env.RESEND_API_KEY || ''
 const INVOICE_FROM = process.env.INVOICE_FROM || 'OmniMargen <facturas@omnimargen.site>'
-// Módulos que se pueden comprar por suscripción (el Comercializador es la base)
 const MODULOS_COMPRABLES = MODULE_IDS.filter((m) => m !== 'comercializador')
 
 function priceIdFor(modulo) {
@@ -31,12 +30,10 @@ function plusDays(baseDate, days) {
   return d.toISOString().split('T')[0]
 }
 
-// Días de gracia por impago antes de revocar la licencia (modo lectura offline)
 const GRACE_DAYS = Number(process.env.LICENSE_GRACE_DAYS || 14)
 
 let privateKey = null
 try {
-  // Primero intentar desde variable de entorno (para Railway)
   if (process.env.LICENSE_PRIVATE_KEY) {
     privateKey = process.env.LICENSE_PRIVATE_KEY
     console.log('🔑 Clave privada cargada desde variable de entorno')
@@ -78,7 +75,7 @@ function json(res, status, payload) {
   res.end(JSON.stringify(payload, null, 2))
 }
 
-function requireAdmin(req, res) {
+async function requireAdmin(req, res) {
   if (req.headers['x-admin-key'] !== ADMIN_API_KEY) {
     json(res, 401, { success: false, error: 'X-Admin-Key inválida' })
     return false
@@ -86,13 +83,13 @@ function requireAdmin(req, res) {
   return true
 }
 
-function requireEmpresa(req, res) {
+async function requireEmpresa(req, res) {
   const apiKey = req.headers['x-api-key']
   if (!apiKey) {
     json(res, 401, { success: false, error: 'Falta X-Api-Key' })
     return null
   }
-  const empresa = db.prepare('SELECT * FROM empresas WHERE api_key = ?').get(apiKey)
+  const empresa = await db.prepare('SELECT * FROM empresas WHERE api_key = $1').get(apiKey)
   if (!empresa) {
     json(res, 401, { success: false, error: 'Api key desconocida' })
     return null
@@ -101,7 +98,6 @@ function requireEmpresa(req, res) {
 }
 
 // ---------- cuenta web: password (scrypt) + tokens (HMAC-SHA256) ----------
-// Cero dependencias: scrypt y HMAC son módulos built-in de node:crypto.
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-jwt-secret'
 
@@ -144,7 +140,7 @@ function verifyToken(token) {
   }
 }
 
-function requireUser(req, res) {
+async function requireUser(req, res) {
   const auth = req.headers['authorization'] || ''
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : ''
   const payload = verifyToken(token)
@@ -152,7 +148,7 @@ function requireUser(req, res) {
     json(res, 401, { success: false, error: 'Token inválido o expirado' })
     return null
   }
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(payload.uid)
+  const user = await db.prepare('SELECT * FROM users WHERE id = $1').get(payload.uid)
   if (!user) {
     json(res, 401, { success: false, error: 'Usuario no encontrado' })
     return null
@@ -161,13 +157,10 @@ function requireUser(req, res) {
 }
 
 // ---------- precios del carrito de compras ----------
-// TOG base: 15$/mes · 40$/3 meses · 150$/año. Cada módulo adicional +3$/mes.
-// OmniServ: 3$/mes (botón único, no pasa por el carrito).
 
 const PRECIOS_TOG = { mensual: 15, trimestral: 40, anual: 150 }
 const EXTRA_MODULO_MENSUAL = 3
 const MESES_POR_PERIODO = { mensual: 1, trimestral: 3, anual: 12 }
-// Módulos vendibles como extra sobre la base Comercializador (en orden canónico)
 const MODULOS_EXTRA = MODULE_IDS.filter((m) => m !== 'comercializador' && m !== 'omniserv')
 
 function precioModulosExtra(periodo, modulos) {
@@ -188,11 +181,9 @@ function paginaSimple(title, body) {
   return `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>${title}</title></head><body style="font-family:sans-serif;max-width:560px;margin:80px auto;text-align:center"><h1>${title}</h1><p>${body}</p></body></html>`
 }
 
-// Módulos de la licencia más reciente (aunque esté revocada) para preservar
-// las compras acumuladas al re-emitir.
-function modulosDeUltimaLicencia(empresaId) {
-  const ultima = db
-    .prepare('SELECT modules FROM licencias WHERE empresa_id = ? ORDER BY issued_at DESC, id DESC LIMIT 1')
+async function modulosDeUltimaLicencia(empresaId) {
+  const ultima = await db
+    .prepare('SELECT modules FROM licencias WHERE empresa_id = $1 ORDER BY issued_at DESC, id DESC LIMIT 1')
     .get(empresaId)
   let modulos = []
   try {
@@ -205,43 +196,38 @@ function moduloDePriceId(priceId) {
   return MODULOS_COMPRABLES.find((m) => priceIdFor(m) === priceId) || null
 }
 
-// Emite (o renueva) la licencia de una empresa con un conjunto de módulos
-// (suma a los acumulados de la última licencia, preservando compras previas).
-function emitirLicenciaConModulos(empresa, { modulos, por, meses = 1 }) {
+async function emitirLicenciaConModulos(empresa, { modulos, por, meses = 1 }) {
   if (!privateKey) throw new Error('Clave privada no configurada para firmar la licencia')
-  const conjunto = new Set([...modulosDeUltimaLicencia(empresa.id), ...modulos])
+  const conjunto = new Set([...(await modulosDeUltimaLicencia(empresa.id)), ...modulos])
   const ordenados = MODULE_IDS.filter((m) => conjunto.has(m))
   const license = signLicense(privateKey, {
     cliente: empresa.nombre,
     expira: plusMonths(new Date(), meses),
     modules: ordenados,
   })
-  db.prepare(
+  await db.prepare(
     `INSERT INTO licencias
        (empresa_id, modules, max_usuarios, max_sucursales, issued_at, expires_at, payload_json, emitida_por)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
   ).run(empresa.id, JSON.stringify(license.modules || []), 1, 1, license.emitida, license.expira, JSON.stringify(license), por)
   return license
 }
 
-// Compatibilidad: emite sumando un solo módulo (flujo Stripe y Crixto OmniServ).
-function emitirLicencia(empresa, { modulo, por, meses = 1 }) {
+async function emitirLicencia(empresa, { modulo, por, meses = 1 }) {
   return emitirLicenciaConModulos(empresa, { modulos: [modulo], por, meses })
 }
 
 // ---------- facturas / recibos ----------
 
-// Número de factura secuencial por año: F-2026-0001, F-2026-0002, …
-function generarNroFactura() {
+async function generarNroFactura() {
   const year = new Date().getFullYear()
-  const row = db
-    .prepare("SELECT COUNT(*) AS n FROM pagos WHERE nro_factura IS NOT NULL AND substr(nro_factura, 3, 4) = ?")
+  const row = await db
+    .prepare("SELECT COUNT(*) AS n FROM pagos WHERE nro_factura IS NOT NULL AND substr(nro_factura, 3, 4) = $1")
     .get(String(year))
   const siguiente = Number(row?.n || 0) + 1
   return `F-${year}-${String(siguiente).padStart(4, '0')}`
 }
 
-// HTML autocontenido e imprimible del recibo/factura de un pago confirmado.
 function htmlFactura(pago, empresa, user) {
   let detalle = {}
   try {
@@ -290,8 +276,6 @@ function htmlFactura(pago, empresa, user) {
 </body></html>`
 }
 
-// Envía la factura por email vía Resend. Silencioso: no falla el flujo de pago
-// si el email no se puede enviar (se loguea y sigue).
 async function sendInvoiceEmail(pago, empresa, user) {
   if (!RESEND_API_KEY) return
   const emailDestino = user?.email || empresa?.email_contacto
@@ -318,37 +302,30 @@ async function sendInvoiceEmail(pago, empresa, user) {
   }
 }
 
-// Grace period vencido sin pago → 'cancelado_impago' y revocación de la licencia.
-// Se ejecuta antes de servir una licencia (y en cada webhook) para no depender
-// de un cron.
-function revocarImpagosVencidos() {
+async function revocarImpagosVencidos() {
   const hoy = new Date().toISOString().split('T')[0]
-  const vencidas = db
-    .prepare("SELECT id, empresa_id FROM suscripciones WHERE estado = 'impago' AND grace_ends_at IS NOT NULL AND grace_ends_at < ?")
+  const vencidas = await db
+    .prepare("SELECT id, empresa_id FROM suscripciones WHERE estado = 'impago' AND grace_ends_at IS NOT NULL AND grace_ends_at < $1")
     .all(hoy)
   if (!vencidas.length) return
-  db.exec('BEGIN')
+  await db.exec('BEGIN')
   try {
     for (const s of vencidas) {
-      db.prepare("UPDATE suscripciones SET estado = 'cancelado_impago', updated_at = datetime('now') WHERE id = ?").run(s.id)
-      db.prepare(
-        "UPDATE licencias SET revoked_at = datetime('now'), motivo_revocado = 'impago:grace-period' WHERE empresa_id = ? AND revoked_at IS NULL"
+      await db.prepare(`UPDATE suscripciones SET estado = 'cancelado_impago', updated_at = ${NOW} WHERE id = $1`).run(s.id)
+      await db.prepare(
+        `UPDATE licencias SET revoked_at = ${NOW}, motivo_revocado = 'impago:grace-period' WHERE empresa_id = $1 AND revoked_at IS NULL`
       ).run(s.empresa_id)
     }
-    db.exec('COMMIT')
+    await db.exec('COMMIT')
   } catch (err) {
     try {
-      db.exec('ROLLBACK')
-    } catch {
-      // sin transacción activa
-    }
+      await db.exec('ROLLBACK')
+    } catch {}
     throw err
   }
 }
 
-// Procesa checkout.session.completed: activa el módulo comprado emitiendo una
-// licencia nueva (módulos acumulados + comprado) con 1 mes de vigencia.
-function procesarCheckout(event) {
+async function procesarCheckout(event) {
   const session = event?.data?.object || {}
   const modulo = session?.metadata?.modulo
   if (!MODULOS_COMPRABLES.includes(modulo)) {
@@ -356,20 +333,20 @@ function procesarCheckout(event) {
   }
   const empresaId = Number(session?.client_reference_id)
   const empresa = empresaId
-    ? db.prepare('SELECT * FROM empresas WHERE id = ?').get(empresaId)
-    : db.prepare('SELECT * FROM empresas WHERE stripe_customer_id = ?').get(session?.customer)
+    ? await db.prepare('SELECT * FROM empresas WHERE id = $1').get(empresaId)
+    : await db.prepare('SELECT * FROM empresas WHERE stripe_customer_id = $1').get(session?.customer)
   if (!empresa) throw new Error('Empresa no encontrada para el checkout')
   if (session?.customer) {
-    db.prepare('UPDATE empresas SET stripe_customer_id = ? WHERE id = ?').run(session.customer, empresa.id)
+    await db.prepare('UPDATE empresas SET stripe_customer_id = $1 WHERE id = $2').run(session.customer, empresa.id)
   }
-  emitirLicencia(empresa, { modulo, por: `stripe:${event.id}` })
+  await emitirLicencia(empresa, { modulo, por: `stripe:${event.id}` })
 
   const subId = session?.subscription ? String(session.subscription) : null
   if (subId) {
-    db.prepare(
+    await db.prepare(
       `INSERT INTO suscripciones (empresa_id, stripe_subscription_id, stripe_price_id, estado, failed_at, grace_ends_at)
-       VALUES (?, ?, ?, 'active', NULL, NULL)
-       ON CONFLICT(stripe_subscription_id) DO UPDATE SET estado = 'active', failed_at = NULL, grace_ends_at = NULL, updated_at = datetime('now')`
+       VALUES ($1, $2, $3, 'active', NULL, NULL)
+       ON CONFLICT(stripe_subscription_id) DO UPDATE SET estado = 'active', failed_at = NULL, grace_ends_at = NULL, updated_at = ${NOW}`
     ).run(empresa.id, subId, priceIdFor(modulo))
   }
 }
@@ -384,21 +361,17 @@ async function handle(req, res) {
     return json(res, 200, { ok: true, db: true, firmando: !!privateKey, tiempo: new Date().toISOString() })
   }
 
-  // GET /api/time — hora del servidor (para validar contra manipulación de fecha local)
+  // GET /api/time
   if (method === 'GET' && path === '/api/time') {
     return json(res, 200, { server_time: Date.now(), iso: new Date().toISOString() })
   }
 
-  // POST /api/empresas  (admin) — alta inicial de empresa, genera api_key
-  // Identificación internacional: pais (ISO 3166-1 alpha-2) + documento de
-  // registro/tributario (RIF, EIN, NIT, CUIT, CNPJ, VAT…). Un mismo número en
-  // países distintos es válido; duplicado solo dentro del mismo país.
+  // POST /api/empresas (admin)
   if (method === 'POST' && path === '/api/empresas') {
-    if (!requireAdmin(req, res)) return
+    if (!(await requireAdmin(req, res))) return
     const body = await readBody(req)
     const nombre = typeof body?.nombre === 'string' ? body.nombre.trim() : ''
     const pais = (typeof body?.pais === 'string' ? body.pais.trim().toUpperCase() : 'VE') || 'VE'
-    // Canónico en mayúsculas: los documentos tributarios/registrales no distinguen caja
     const documento = typeof body?.documento === 'string' ? body.documento.trim().toUpperCase() : ''
     const emailContacto = typeof body?.email_contacto === 'string' ? body.email_contacto.trim() : ''
     if (!nombre || !documento || !emailContacto) {
@@ -412,8 +385,8 @@ async function handle(req, res) {
     }
     const apiKey = crypto.randomBytes(16).toString('hex')
     try {
-      const result = db
-        .prepare('INSERT INTO empresas (nombre, pais, documento, email_contacto, api_key) VALUES (?, ?, ?, ?, ?)')
+      const result = await db
+        .prepare('INSERT INTO empresas (nombre, pais, documento, email_contacto, api_key) VALUES ($1, $2, $3, $4, $5)')
         .run(nombre, pais, documento, emailContacto, apiKey)
       return json(res, 201, { success: true, id: result.lastInsertRowid, api_key: apiKey })
     } catch (err) {
@@ -421,21 +394,19 @@ async function handle(req, res) {
     }
   }
 
-  // GET /api/admin/empresas  (admin) — listado (incluye vínculo de dispositivo)
+  // GET /api/admin/empresas (admin)
   if (method === 'GET' && path === '/api/admin/empresas') {
-    if (!requireAdmin(req, res)) return
-    const rows = db.prepare('SELECT id, nombre, pais, documento, email_contacto, device_fingerprint, payment_status, created_at FROM empresas ORDER BY created_at DESC').all()
+    if (!(await requireAdmin(req, res))) return
+    const rows = await db.prepare('SELECT id, nombre, pais, documento, email_contacto, device_fingerprint, payment_status, created_at FROM empresas ORDER BY created_at DESC').all()
     return json(res, 200, { empresas: rows })
   }
 
-  // POST /api/admin/empresas/:id/dispositivo  (admin) — transferencia de licencia a otro teléfono
-  // { device_fingerprint: null }     → desvincula: el próximo teléfono que reclame la licencia queda vinculado
-  // { device_fingerprint: "<hash>" } → vincula directamente al dispositivo indicado
+  // POST /api/admin/empresas/:id/dispositivo (admin)
   const dispositivoMatch = path.match(/^\/api\/admin\/empresas\/(\d+)\/dispositivo$/)
   if (method === 'POST' && dispositivoMatch) {
-    if (!requireAdmin(req, res)) return
+    if (!(await requireAdmin(req, res))) return
     const empresaId = Number(dispositivoMatch[1])
-    if (!db.prepare('SELECT id FROM empresas WHERE id = ?').get(empresaId)) {
+    if (!(await db.prepare('SELECT id FROM empresas WHERE id = $1').get(empresaId))) {
       return json(res, 404, { success: false, error: 'Empresa no encontrada' })
     }
     const body = await readBody(req)
@@ -443,12 +414,12 @@ async function handle(req, res) {
     if (nuevo === '') {
       return json(res, 400, { success: false, error: 'device_fingerprint debe ser un hash no vacío o null (para desvincular)' })
     }
-    db.prepare('UPDATE empresas SET device_fingerprint = ? WHERE id = ?').run(nuevo, empresaId)
-    const row = db.prepare('SELECT id, device_fingerprint FROM empresas WHERE id = ?').get(empresaId)
+    await db.prepare('UPDATE empresas SET device_fingerprint = $1 WHERE id = $2').run(nuevo, empresaId)
+    const row = await db.prepare('SELECT id, device_fingerprint FROM empresas WHERE id = $1').get(empresaId)
     return json(res, 200, { success: true, empresa_id: row.id, device_fingerprint: row.device_fingerprint })
   }
 
-  // POST /api/empresas/register  (público) — registro de cliente desde la app
+  // POST /api/empresas/register (public)
   if (method === 'POST' && path === '/api/empresas/register') {
     const body = await readBody(req)
     const nombre = typeof body?.nombre === 'string' ? body.nombre.trim() : ''
@@ -467,11 +438,8 @@ async function handle(req, res) {
       return json(res, 400, { success: false, error: 'device_fingerprint es requerido (hash SHA-256 del dispositivo)' })
     }
 
-    // Verificar si ya existe una empresa con ese país y documento
-    const existente = db.prepare('SELECT id, api_key, nombre, email_contacto, payment_status, device_fingerprint FROM empresas WHERE pais = ? AND documento = ?').get(pais, documento)
+    const existente = await db.prepare('SELECT id, api_key, nombre, email_contacto, payment_status, device_fingerprint FROM empresas WHERE pais = $1 AND documento = $2').get(pais, documento)
     if (existente) {
-      // Licencia de un solo dispositivo: si los mismos datos vienen de otro
-      // teléfono, no se revela la api_key (aquí es donde se bypaseaba la licencia).
       if (existente.device_fingerprint && existente.device_fingerprint !== deviceFingerprint) {
         return json(res, 403, {
           success: false,
@@ -495,8 +463,8 @@ async function handle(req, res) {
 
     const apiKey = crypto.randomBytes(16).toString('hex')
     try {
-      const result = db
-        .prepare('INSERT INTO empresas (nombre, pais, documento, email_contacto, api_key, device_fingerprint, payment_status) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      const result = await db
+        .prepare('INSERT INTO empresas (nombre, pais, documento, email_contacto, api_key, device_fingerprint, payment_status) VALUES ($1, $2, $3, $4, $5, $6, $7)')
         .run(nombre, pais, documento, emailContacto, apiKey, deviceFingerprint, 'pending')
       return json(res, 201, { 
         success: true, 
@@ -510,12 +478,7 @@ async function handle(req, res) {
     }
   }
 
-  // GET /api/payment/confirm — confirmación de pago desde Crixto.
-  // 1) ?payment_id=X (carrito TOG desde la landing) → confirma ese pago, emite
-  //    la licencia con los módulos del carrito y genera la factura.
-  // 2) ?empresa_id=X (deep link OmniServ) → flujo histórico: marca el pago de
-  //    la empresa y emite licencia omniserv (1 mes).
-  // 3) sin parámetros (URL fija del panel de Crixto) → página genérica de éxito.
+  // GET /api/payment/confirm
   if (method === 'GET' && path === '/api/payment/confirm') {
     const paymentId = url.searchParams.get('payment_id')
     const empresaId = url.searchParams.get('empresa_id')
@@ -523,19 +486,18 @@ async function handle(req, res) {
     const providerRef = extra.length ? extra.map(([k, v]) => `${k}=${v}`).join('&') : null
 
     try {
-      // Carrito TOG: confirmar el pago exacto (idempotente)
       if (paymentId) {
-        const pago = db.prepare('SELECT * FROM pagos WHERE id = ?').get(Number(paymentId))
+        const pago = await db.prepare('SELECT * FROM pagos WHERE id = $1').get(Number(paymentId))
         if (!pago) {
           res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
           res.end(paginaSimple('Error', 'Pago no encontrado'))
           return
         }
-        const empresa = db.prepare('SELECT * FROM empresas WHERE id = ?').get(pago.empresa_id)
+        const empresa = await db.prepare('SELECT * FROM empresas WHERE id = $1').get(pago.empresa_id)
         if (!empresa) throw new Error('Empresa del pago no encontrada')
         if (pago.estado !== 'confirmed') {
-          const nroFactura = generarNroFactura()
-          db.prepare("UPDATE pagos SET estado = 'confirmed', paid_at = datetime('now'), nro_factura = ?, provider_ref = COALESCE(?, provider_ref) WHERE id = ?")
+          const nroFactura = await generarNroFactura()
+          await db.prepare(`UPDATE pagos SET estado = 'confirmed', paid_at = ${NOW}, nro_factura = $1, provider_ref = COALESCE($2, provider_ref) WHERE id = $3`)
             .run(nroFactura, providerRef, pago.id)
           const detalle = (() => {
             try {
@@ -547,10 +509,10 @@ async function handle(req, res) {
           const modulos = Array.isArray(detalle.modulos) && detalle.modulos.length ? detalle.modulos : ['comercializador']
           const meses = MESES_POR_PERIODO[detalle.periodo] || 1
           if (privateKey) {
-            emitirLicenciaConModulos(empresa, { modulos, por: `crixto:${pago.id}`, meses })
+            await emitirLicenciaConModulos(empresa, { modulos, por: `crixto:${pago.id}`, meses })
           }
-          const pagoConfirmado = db.prepare('SELECT * FROM pagos WHERE id = ?').get(pago.id)
-          const user = pago.user_id ? db.prepare('SELECT * FROM users WHERE id = ?').get(pago.user_id) : null
+          const pagoConfirmado = await db.prepare('SELECT * FROM pagos WHERE id = $1').get(pago.id)
+          const user = pago.user_id ? await db.prepare('SELECT * FROM users WHERE id = $1').get(pago.user_id) : null
           sendInvoiceEmail(pagoConfirmado, empresa, user)
           res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
           res.end(
@@ -566,20 +528,19 @@ async function handle(req, res) {
         return
       }
 
-      // OmniServ (deep link con empresa_id): mantener el flujo histórico
       if (empresaId) {
-        db.prepare("UPDATE empresas SET payment_status = 'confirmed', payment_confirmed_at = datetime('now') WHERE id = ?")
+        await db.prepare(`UPDATE empresas SET payment_status = 'confirmed', payment_confirmed_at = ${NOW} WHERE id = $1`)
           .run(Number(empresaId))
-        const empresa = db.prepare('SELECT * FROM empresas WHERE id = ?').get(Number(empresaId))
+        const empresa = await db.prepare('SELECT * FROM empresas WHERE id = $1').get(Number(empresaId))
         if (empresa && privateKey) {
-          emitirLicencia(empresa, { modulo: 'omniserv', por: 'crixto:auto', meses: 1 })
+          await emitirLicencia(empresa, { modulo: 'omniserv', por: 'crixto:auto', meses: 1 })
         }
         if (empresa) {
-          const result = db.prepare(
-            "INSERT INTO pagos (user_id, empresa_id, concepto, detalle, monto, moneda, estado, provider, nro_factura, paid_at) VALUES (NULL, ?, 'omniserv:mensual', ?, 3, 'USD', 'confirmed', 'crixto', ?, datetime('now'))"
-          ).run(empresa.id, JSON.stringify({ producto: 'omniserv', periodo: 'mensual', modulos: ['omniserv'], desglose: [{ modulo: 'OmniServ — mensual', precio: 3 }] }), generarNroFactura())
-          const pago = db.prepare('SELECT * FROM pagos WHERE id = ?').get(result.lastInsertRowid)
-          const user = db.prepare('SELECT * FROM users WHERE empresa_id = ?').get(empresa.id)
+          const result = await db.prepare(
+            `INSERT INTO pagos (user_id, empresa_id, concepto, detalle, monto, moneda, estado, provider, nro_factura, paid_at) VALUES (NULL, $1, 'omniserv:mensual', $2, 3, 'USD', 'confirmed', 'crixto', $3, ${NOW})`
+          ).run(empresa.id, JSON.stringify({ producto: 'omniserv', periodo: 'mensual', modulos: ['omniserv'], desglose: [{ modulo: 'OmniServ — mensual', precio: 3 }] }), await generarNroFactura())
+          const pago = await db.prepare('SELECT * FROM pagos WHERE id = $1').get(result.lastInsertRowid)
+          const user = await db.prepare('SELECT * FROM users WHERE empresa_id = $1').get(empresa.id)
           sendInvoiceEmail(pago, empresa, user)
         }
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
@@ -587,8 +548,6 @@ async function handle(req, res) {
         return
       }
 
-      // URL fija del panel de Crixto: página genérica (la confirmación real la
-      // hace la landing vía el payment_id del formulario).
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       res.end(paginaSimple('✅ Pago exitoso', 'Gracias por tu pago. Vuelve a <a href="https://omnimargen.site/cuenta">tu cuenta OmniMargen</a> para ver tus servicios activos y tus facturas.'))
       return
@@ -599,8 +558,7 @@ async function handle(req, res) {
     return
   }
 
-  // POST /api/auth/register — alta de cuenta web (email + contraseña).
-  // Crea/vincula la empresa por identidad internacional (pais + documento).
+  // POST /api/auth/register
   if (method === 'POST' && path === '/api/auth/register') {
     const body = await readBody(req)
     const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : ''
@@ -619,35 +577,35 @@ async function handle(req, res) {
     if (password.length < 6) {
       return json(res, 400, { success: false, error: 'La contraseña debe tener al menos 6 caracteres' })
     }
-    if (db.prepare('SELECT id FROM users WHERE email = ?').get(email)) {
+    if (await db.prepare('SELECT id FROM users WHERE email = $1').get(email)) {
       return json(res, 409, { success: false, error: 'Ya existe una cuenta con ese email' })
     }
 
     let empresa = null
     if (documento) {
-      empresa = db.prepare('SELECT * FROM empresas WHERE pais = ? AND documento = ?').get(pais, documento)
+      empresa = await db.prepare('SELECT * FROM empresas WHERE pais = $1 AND documento = $2').get(pais, documento)
       if (!empresa) {
         const apiKey = crypto.randomBytes(16).toString('hex')
-        const result = db
-          .prepare('INSERT INTO empresas (nombre, pais, documento, email_contacto, api_key) VALUES (?, ?, ?, ?, ?)')
+        const result = await db
+          .prepare('INSERT INTO empresas (nombre, pais, documento, email_contacto, api_key) VALUES ($1, $2, $3, $4, $5)')
           .run(nombre, pais, documento, email, apiKey)
-        empresa = db.prepare('SELECT * FROM empresas WHERE id = ?').get(result.lastInsertRowid)
+        empresa = await db.prepare('SELECT * FROM empresas WHERE id = $1').get(result.lastInsertRowid)
       }
     }
 
-    const result = db
-      .prepare('INSERT INTO users (email, password_hash, nombre, pais, documento, telefono, empresa_id) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    const result = await db
+      .prepare('INSERT INTO users (email, password_hash, nombre, pais, documento, telefono, empresa_id) VALUES ($1, $2, $3, $4, $5, $6, $7)')
       .run(email, hashPassword(password), nombre, pais, documento, telefono || null, empresa?.id || null)
-    const user = db.prepare('SELECT id, email, nombre, pais, documento, telefono, empresa_id, created_at FROM users WHERE id = ?').get(result.lastInsertRowid)
+    const user = await db.prepare('SELECT id, email, nombre, pais, documento, telefono, empresa_id, created_at FROM users WHERE id = $1').get(result.lastInsertRowid)
     return json(res, 201, { success: true, token: signToken({ uid: user.id }), user })
   }
 
-  // POST /api/auth/login — iniciar sesión con email + contraseña
+  // POST /api/auth/login
   if (method === 'POST' && path === '/api/auth/login') {
     const body = await readBody(req)
     const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : ''
     const password = typeof body?.password === 'string' ? body.password : ''
-    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email)
+    const user = await db.prepare('SELECT * FROM users WHERE email = $1').get(email)
     if (!user || !verifyPassword(password, user.password_hash)) {
       return json(res, 401, { success: false, error: 'Email o contraseña incorrectos' })
     }
@@ -655,9 +613,7 @@ async function handle(req, res) {
     return json(res, 200, { success: true, token: signToken({ uid: user.id }), user: publico })
   }
 
-  // POST /api/auth/forgot — guarda el hash del token de recuperación que
-  // generó el emisor del email (la landing). Respuesta genérica para no
-  // revelar si el email existe. Expiración por defecto: 1 hora.
+  // POST /api/auth/forgot
   if (method === 'POST' && path === '/api/auth/forgot') {
     const body = await readBody(req)
     const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : ''
@@ -666,21 +622,19 @@ async function handle(req, res) {
     if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) || !/^[a-f0-9]{64}$/.test(tokenHash)) {
       return json(res, 400, { success: false, error: 'email y token_hash (sha256 hex) son requeridos' })
     }
-    const user = db.prepare('SELECT id FROM users WHERE email = ?').get(email)
+    const user = await db.prepare('SELECT id FROM users WHERE email = $1').get(email)
     if (user) {
       const expira = new Date(Date.now() + 60 * 60 * 1000).toISOString()
-      db.exec('BEGIN')
+      await db.exec('BEGIN')
       try {
-      db.prepare('UPDATE password_resets SET usado = 1 WHERE user_id = ?').run(user.id)
-      db.prepare('INSERT INTO password_resets (user_id, token_hash, expira) VALUES (?, ?, ?)').run(user.id, tokenHash, expira)
-      console.log(`[forgot] STORED user=${user.id} email=${email} hash=${tokenHash.slice(0, 8)}… expires=${expira}`)
-      db.exec('COMMIT')
+        await db.prepare('UPDATE password_resets SET usado = TRUE WHERE user_id = $1').run(user.id)
+        await db.prepare('INSERT INTO password_resets (user_id, token_hash, expira) VALUES ($1, $2, $3)').run(user.id, tokenHash, expira)
+        console.log(`[forgot] STORED user=${user.id} email=${email} hash=${tokenHash.slice(0, 8)}… expires=${expira}`)
+        await db.exec('COMMIT')
       } catch (err) {
         try {
-          db.exec('ROLLBACK')
-        } catch {
-          // sin transacción activa
-        }
+          await db.exec('ROLLBACK')
+        } catch {}
         throw err
       }
     } else {
@@ -689,7 +643,7 @@ async function handle(req, res) {
     return json(res, 200, { success: true, email_exists: !!user, message: 'Si el email existe, recibirás un enlace para restablecer tu contraseña.' })
   }
 
-  // POST /api/auth/reset-password — cambia la contraseña con el token válido
+  // POST /api/auth/reset-password
   if (method === 'POST' && path === '/api/auth/reset-password') {
     const body = await readBody(req)
     const token = typeof body?.token === 'string' ? body.token.trim() : ''
@@ -699,28 +653,28 @@ async function handle(req, res) {
       return json(res, 400, { success: false, error: 'La contraseña debe tener al menos 6 caracteres' })
     }
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex')
-    const row = db.prepare('SELECT id, user_id, expira, usado FROM password_resets WHERE token_hash = ?').get(tokenHash)
+    const row = await db.prepare('SELECT id, user_id, expira, usado FROM password_resets WHERE token_hash = $1').get(tokenHash)
     console.log(`[reset] token_len=${token.length} hash=${tokenHash.slice(0, 8)}… found=${!!row} usado=${row?.usado} expira=${row?.expira}`)
-    if (!row || row.usado === 1) {
+    if (!row || row.usado === true || row.usado === 1) {
       return json(res, 400, { success: false, error: 'Token inválido o ya utilizado' })
     }
     if (new Date(row.expira).getTime() < Date.now()) {
       return json(res, 400, { success: false, error: 'Token expirado. Solicita un nuevo enlace.' })
     }
-    db.prepare('UPDATE users SET password_hash = ?, updated_at = datetime(\'now\') WHERE id = ?').run(hashPassword(password), row.user_id)
-    db.prepare('UPDATE password_resets SET usado = 1 WHERE id = ?').run(row.id)
+    await db.prepare(`UPDATE users SET password_hash = $1, updated_at = ${NOW} WHERE id = $2`).run(hashPassword(password), row.user_id)
+    await db.prepare('UPDATE password_resets SET usado = TRUE WHERE id = $1').run(row.id)
     return json(res, 200, { success: true, message: 'Contraseña actualizada. Ya puedes iniciar sesión.' })
   }
 
-  // GET /api/user/profile — datos de la cuenta, empresa vinculada, licencia y pagos
+  // GET /api/user/profile
   if (method === 'GET' && path === '/api/user/profile') {
-    const user = requireUser(req, res)
+    const user = await requireUser(req, res)
     if (!user) return
-    const empresa = user.empresa_id ? db.prepare('SELECT * FROM empresas WHERE id = ?').get(user.empresa_id) : null
-    const licencia = empresa ? getActiveLicense(empresa.id) : null
+    const empresa = user.empresa_id ? await db.prepare('SELECT * FROM empresas WHERE id = $1').get(user.empresa_id) : null
+    const licencia = empresa ? await getActiveLicense(empresa.id) : null
     const host = req.headers.host ? `https://${req.headers.host}` : ''
-    const pagos = db
-      .prepare('SELECT id, concepto, monto, moneda, estado, nro_factura, paid_at, created_at FROM pagos WHERE user_id = ? ORDER BY id DESC LIMIT 50')
+    const pagos = await db
+      .prepare('SELECT id, concepto, monto, moneda, estado, nro_factura, paid_at, created_at FROM pagos WHERE user_id = $1 ORDER BY id DESC LIMIT 50')
       .all(user.id)
     const pagosConUrl = pagos.map((p) => ({
       ...p,
@@ -736,10 +690,9 @@ async function handle(req, res) {
     })
   }
 
-  // POST /api/payment/create — carrito CRIXTO: crea el pago y devuelve el monto
-  // y la URL de retorno (el formulario de la landing programa amount_cx con ese monto).
+  // POST /api/payment/create
   if (method === 'POST' && path === '/api/payment/create') {
-    const user = requireUser(req, res)
+    const user = await requireUser(req, res)
     if (!user) return
     const body = await readBody(req)
     const periodo = body?.periodo
@@ -755,14 +708,14 @@ async function handle(req, res) {
     const monto = totalCarrito(periodo, modulos)
     if (monto == null) return json(res, 400, { success: false, error: 'No se pudo calcular el monto del carrito' })
 
-    const empresa = user.empresa_id ? db.prepare('SELECT * FROM empresas WHERE id = ?').get(user.empresa_id) : null
+    const empresa = user.empresa_id ? await db.prepare('SELECT * FROM empresas WHERE id = $1').get(user.empresa_id) : null
     if (!empresa) return json(res, 400, { success: false, error: 'Vincula tu cuenta a una empresa (país + documento) para comprar' })
 
     const desglose = [{ modulo: `TOG Admin (base ${periodo})`, precio: PRECIOS_TOG[periodo] }]
     for (const m of modulos) desglose.push({ modulo: `Módulo ${m}`, precio: EXTRA_MODULO_MENSUAL * MESES_POR_PERIODO[periodo] })
 
-    const result = db
-      .prepare("INSERT INTO pagos (user_id, empresa_id, concepto, detalle, monto, moneda, estado, provider) VALUES (?, ?, ?, ?, ?, 'USD', 'pending', 'crixto')")
+    const result = await db
+      .prepare("INSERT INTO pagos (user_id, empresa_id, concepto, detalle, monto, moneda, estado, provider) VALUES ($1, $2, $3, $4, $5, 'USD', 'pending', 'crixto')")
       .run(user.id, empresa.id, `tog:${periodo}`, JSON.stringify({ producto: 'tog', periodo, modulos: ['comercializador', ...modulos], desglose }), monto)
     const pagoId = result.lastInsertRowid
 
@@ -779,19 +732,18 @@ async function handle(req, res) {
     })
   }
 
-  // POST /api/payment/omniserv-payment — crea pago pendiente de OmniServ ($3/mes)
-  // y devuelve el monto + URL de retorno para el form de Crixto.
+  // POST /api/payment/omniserv-payment
   if (method === 'POST' && path === '/api/payment/omniserv-payment') {
-    const user = requireUser(req, res)
+    const user = await requireUser(req, res)
     if (!user) return
-    const empresa = user.empresa_id ? db.prepare('SELECT * FROM empresas WHERE id = ?').get(user.empresa_id) : null
+    const empresa = user.empresa_id ? await db.prepare('SELECT * FROM empresas WHERE id = $1').get(user.empresa_id) : null
     if (!empresa) return json(res, 400, { success: false, error: 'Vincula tu cuenta a una empresa (país + documento) para comprar' })
 
     const monto = 3
     const desglose = [{ modulo: 'OmniServ — mensual', precio: monto }]
 
-    const result = db
-      .prepare("INSERT INTO pagos (user_id, empresa_id, concepto, detalle, monto, moneda, estado, provider) VALUES (?, ?, ?, ?, ?, 'USD', 'pending', 'crixto')")
+    const result = await db
+      .prepare("INSERT INTO pagos (user_id, empresa_id, concepto, detalle, monto, moneda, estado, provider) VALUES ($1, $2, $3, $4, $5, 'USD', 'pending', 'crixto')")
       .run(user.id, empresa.id, 'omniserv:mensual', JSON.stringify({ producto: 'omniserv', periodo: 'mensual', modulos: ['omniserv'], desglose }), monto)
     const pagoId = result.lastInsertRowid
 
@@ -806,43 +758,40 @@ async function handle(req, res) {
     })
   }
 
-  // GET /api/pagos/:id/factura — recibo/factura HTML imprimible
+  // GET /api/pagos/:id/factura
   const facturaMatch = path.match(/^\/api\/pagos\/(\d+)\/factura$/)
   if (method === 'GET' && facturaMatch) {
-    const pago = db.prepare('SELECT * FROM pagos WHERE id = ?').get(Number(facturaMatch[1]))
+    const pago = await db.prepare('SELECT * FROM pagos WHERE id = $1').get(Number(facturaMatch[1]))
     if (!pago || pago.estado !== 'confirmed') {
       res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' })
       res.end(paginaSimple('No encontrada', 'Esta factura no existe o el pago aún no fue confirmado.'))
       return
     }
-    const empresa = db.prepare('SELECT * FROM empresas WHERE id = ?').get(pago.empresa_id)
-    const user = pago.user_id ? db.prepare('SELECT * FROM users WHERE id = ?').get(pago.user_id) : null
+    const empresa = await db.prepare('SELECT * FROM empresas WHERE id = $1').get(pago.empresa_id)
+    const user = pago.user_id ? await db.prepare('SELECT * FROM users WHERE id = $1').get(pago.user_id) : null
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
     res.end(htmlFactura(pago, empresa, user))
     return
   }
 
-  // GET /api/empresas/:id/payment-status — verificar estado de pago
+  // GET /api/empresas/:id/payment-status
   const paymentStatusMatch = path.match(/^\/api\/empresas\/(\d+)\/payment-status$/)
   if (method === 'GET' && paymentStatusMatch) {
-    const empresa = requireEmpresa(req, res)
+    const empresa = await requireEmpresa(req, res)
     if (!empresa) return
-
-    // Se usa la empresa autenticada por api_key (no el id de la URL) para no
-    // filtrar el estado de pago de otras empresas (IDOR).
     return json(res, 200, {
       success: true,
       payment_confirmed: empresa.payment_status === 'confirmed'
     })
   }
 
-  // POST /api/empresas/:id/licencias  (admin) — emisión manual de licencia
+  // POST /api/empresas/:id/licencias (admin)
   const licenciasMatch = path.match(/^\/api\/empresas\/(\d+)\/licencias$/)
   if (method === 'POST' && licenciasMatch) {
-    if (!requireAdmin(req, res)) return
+    if (!(await requireAdmin(req, res))) return
     if (!privateKey) return json(res, 500, { success: false, error: 'Clave privada no configurada' })
     const empresaId = Number(licenciasMatch[1])
-    const empresa = db.prepare('SELECT * FROM empresas WHERE id = ?').get(empresaId)
+    const empresa = await db.prepare('SELECT * FROM empresas WHERE id = $1').get(empresaId)
     if (!empresa) return json(res, 404, { success: false, error: 'Empresa no encontrada' })
 
     const body = await readBody(req)
@@ -856,10 +805,10 @@ async function handle(req, res) {
       return json(res, 400, { success: false, error: err.message })
     }
 
-    db.prepare(
+    await db.prepare(
       `INSERT INTO licencias
          (empresa_id, modules, max_usuarios, max_sucursales, issued_at, expires_at, payload_json, emitida_por)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'manual:admin')`
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'manual:admin')`
     ).run(
       empresaId,
       JSON.stringify(license.modules || []),
@@ -873,30 +822,25 @@ async function handle(req, res) {
     return json(res, 201, { success: true, licencia: license })
   }
 
-  // GET /api/empresas/:id/licencia  (api_key de la empresa) — licencia activa para "Sincronizar"
+  // GET /api/empresas/:id/licencia (api_key)
   const licenciaMatch = path.match(/^\/api\/empresas\/(\d+)\/licencia$/)
   if (method === 'GET' && licenciaMatch) {
-    const empresa = requireEmpresa(req, res)
+    const empresa = await requireEmpresa(req, res)
     if (!empresa) return
     try {
-      revocarImpagosVencidos()
+      await revocarImpagosVencidos()
     } catch (err) {
       console.error('[licencia] error al barrer impagos vencidos', err.message)
     }
     
-    // Licencia de un solo dispositivo (OmniServ): el teléfono SIEMPRE envía su
-    // fingerprint en el header x-device-fingerprint. TOG Admin no lo envía y no
-    // debe afectarse: el control solo aplica cuando el header viene en la petición.
     const deviceFingerprint = String(req.headers['x-device-fingerprint'] || url.searchParams.get('device_fingerprint') || '').trim()
     if (deviceFingerprint) {
       if (!empresa.device_fingerprint) {
-        // Primer dispositivo que reclama la licencia: queda vinculado (atómico;
-        // si otro teléfono lo reclamó en paralelo, gana el primero).
-        const claimed = db
-          .prepare('UPDATE empresas SET device_fingerprint = ? WHERE id = ? AND device_fingerprint IS NULL')
+        const claimed = await db
+          .prepare('UPDATE empresas SET device_fingerprint = $1 WHERE id = $2 AND device_fingerprint IS NULL')
           .run(deviceFingerprint, empresa.id)
         if (claimed.changes === 0) {
-          const ahora = db.prepare('SELECT device_fingerprint FROM empresas WHERE id = ?').get(empresa.id)
+          const ahora = await db.prepare('SELECT device_fingerprint FROM empresas WHERE id = $1').get(empresa.id)
           if (ahora?.device_fingerprint !== deviceFingerprint) {
             return json(res, 403, {
               success: false,
@@ -916,9 +860,9 @@ async function handle(req, res) {
       }
     }
 
-    const licencia = getActiveLicense(empresa.id)
+    const licencia = await getActiveLicense(empresa.id)
     if (!licencia) {
-      const sub = db.prepare('SELECT estado FROM suscripciones WHERE empresa_id = ? ORDER BY id DESC LIMIT 1').get(empresa.id)
+      const sub = await db.prepare('SELECT estado FROM suscripciones WHERE empresa_id = $1 ORDER BY id DESC LIMIT 1').get(empresa.id)
       if (sub?.estado === 'cancelado_impago') {
         return json(res, 402, {
           success: false,
@@ -930,9 +874,9 @@ async function handle(req, res) {
     return json(res, 200, { success: true, licencia: JSON.parse(licencia.payload_json) })
   }
 
-  // POST /api/checkout-session  (api_key) — Stripe: suscripción de un módulo
+  // POST /api/checkout-session (api_key)
   if (method === 'POST' && path === '/api/checkout-session') {
-    const empresa = requireEmpresa(req, res)
+    const empresa = await requireEmpresa(req, res)
     if (!empresa) return
     const body = await readBody(req)
     const modulo = body?.modulo
@@ -961,7 +905,7 @@ async function handle(req, res) {
           name: empresa.nombre,
         })
         customerId = customer.id
-        db.prepare('UPDATE empresas SET stripe_customer_id = ? WHERE id = ?').run(customerId, empresa.id)
+        await db.prepare('UPDATE empresas SET stripe_customer_id = $1 WHERE id = $2').run(customerId, empresa.id)
       }
       const session = await createCheckoutSession({
         secretKey: process.env.STRIPE_SECRET_KEY,
@@ -978,19 +922,19 @@ async function handle(req, res) {
     }
   }
 
-  // GET /checkout/success|cancel — página de retorno del checkout
+  // GET /checkout/success|cancel
   if (method === 'GET' && path.startsWith('/checkout/')) {
     const exito = path.includes('success')
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
     res.end(
       exito
-        ? paginaSimple('✅ Pago exitoso', 'Tu módulo quedó activado. Vuelve a TOG Admin y presiona “Sincronizar” en Config → Licencia.')
+        ? paginaSimple('✅ Pago exitoso', 'Tu módulo quedó activado. Vuelve a TOG Admin y presiona "Sincronizar" en Config → Licencia.')
         : paginaSimple('Pago cancelado', 'Puedes reintentar el pago cuando quieras. No se te cobró nada.'),
     )
     return
   }
 
-  // POST /api/webhook/stripe — eventos idempotentes (webhook_events por stripe_event_id)
+  // POST /api/webhook/stripe
   if (method === 'POST' && path === '/api/webhook/stripe') {
     if (!STRIPE_WEBHOOK_SECRET || !process.env.STRIPE_SECRET_KEY) {
       return json(res, 503, {
@@ -1013,59 +957,54 @@ async function handle(req, res) {
 
     let resultado
     try {
-      db.exec('BEGIN')
-      const yaProcesado = db.prepare('SELECT 1 FROM webhook_events WHERE stripe_event_id = ?').get(event.id)
+      await db.exec('BEGIN')
+      const yaProcesado = await db.prepare('SELECT 1 FROM webhook_events WHERE stripe_event_id = $1').get(event.id)
       if (yaProcesado) {
         resultado = { duplicado: true }
       } else {
         if (event.type === 'checkout.session.completed') {
-          procesarCheckout(event)
+          await procesarCheckout(event)
         } else if (event.type === 'customer.subscription.deleted') {
           const sub = event?.data?.object
           if (sub?.id) {
-            db.prepare("UPDATE suscripciones SET estado = 'cancelado', cancel_at_period_end = 1 WHERE stripe_subscription_id = ?").run(String(sub.id))
+            await db.prepare("UPDATE suscripciones SET estado = 'cancelado', cancel_at_period_end = TRUE WHERE stripe_subscription_id = $1").run(String(sub.id))
           }
         } else if (event.type === 'invoice.payment_failed') {
           const invoice = event?.data?.object
           const subId = invoice?.subscription ? String(invoice.subscription) : null
           if (subId) {
-            // Entra en grace period: la licencia sigue sirviéndose hasta grace_ends_at
-            db.prepare(
-              "UPDATE suscripciones SET estado = 'impago', failed_at = datetime('now'), grace_ends_at = ?, updated_at = datetime('now') WHERE stripe_subscription_id = ?"
+            await db.prepare(
+              `UPDATE suscripciones SET estado = 'impago', failed_at = ${NOW}, grace_ends_at = $1, updated_at = ${NOW} WHERE stripe_subscription_id = $2`
             ).run(plusDays(new Date(), GRACE_DAYS), subId)
           }
         } else if (event.type === 'invoice.payment_succeeded') {
           const invoice = event?.data?.object
           const subId = invoice?.subscription ? String(invoice.subscription) : null
           if (subId) {
-            const sub = db
-              .prepare('SELECT empresa_id, stripe_price_id FROM suscripciones WHERE stripe_subscription_id = ?')
+            const sub = await db
+              .prepare('SELECT empresa_id, stripe_price_id FROM suscripciones WHERE stripe_subscription_id = $1')
               .get(subId)
             if (sub) {
-              db.prepare(
-                "UPDATE suscripciones SET estado = 'active', failed_at = NULL, grace_ends_at = NULL, cancel_at_period_end = 0, updated_at = datetime('now') WHERE stripe_subscription_id = ?"
+              await db.prepare(
+                `UPDATE suscripciones SET estado = 'active', failed_at = NULL, grace_ends_at = NULL, cancel_at_period_end = FALSE, updated_at = ${NOW} WHERE stripe_subscription_id = $1`
               ).run(subId)
-              const empresa = db.prepare('SELECT * FROM empresas WHERE id = ?').get(sub.empresa_id)
+              const empresa = await db.prepare('SELECT * FROM empresas WHERE id = $1').get(sub.empresa_id)
               const modulo = moduloDePriceId(sub.stripe_price_id)
               if (empresa && modulo) {
-                // Renovación mensual: re-emite la licencia (módulos acumulados + 1 mes)
-                emitirLicencia(empresa, { modulo, por: `stripe:${event.id}` })
+                await emitirLicencia(empresa, { modulo, por: `stripe:${event.id}` })
               }
             }
           }
         }
-        // customer.subscription.updated y otros eventos: se registran y se ignoran en el MVP
-        db.prepare('INSERT INTO webhook_events (stripe_event_id, tipo, payload) VALUES (?, ?, ?)').run(event.id, event.type, JSON.stringify(event))
+        await db.prepare('INSERT INTO webhook_events (stripe_event_id, tipo, payload) VALUES ($1, $2, $3)').run(event.id, event.type, JSON.stringify(event))
         resultado = { duplicado: false }
       }
-      db.exec('COMMIT')
+      await db.exec('COMMIT')
       return json(res, 200, { received: true, ...resultado })
     } catch (err) {
       try {
-        db.exec('ROLLBACK')
-      } catch {
-        // sin transacción activa
-      }
+        await db.exec('ROLLBACK')
+      } catch {}
       console.error('[webhook] error procesando evento', event?.type, err.message)
       return json(res, 500, { success: false, error: err.message })
     }
@@ -1074,10 +1013,6 @@ async function handle(req, res) {
   return json(res, 404, { success: false, error: 'Ruta no encontrada' })
 }
 
-/**
- * Arranca el servidor HTTP. Exportado para poder levantarlo en tests
- * (puerto 0 = efímero) o desde otros procesos sin escuchar al importar.
- */
 export function startServer({ port = PORT } = {}) {
   const server = http.createServer((req, res) => {
     handle(req, res).catch((err) => {
@@ -1094,7 +1029,6 @@ export function startServer({ port = PORT } = {}) {
   return server
 }
 
-// Arranque directo: `node src/server.js` (no al ser importado por tests u otros módulos)
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
 if (isMain) {
   startServer()
