@@ -662,6 +662,7 @@ async function handle(req, res) {
     const body = await readBody(req)
     const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : ''
     const tokenHash = typeof body?.token_hash === 'string' ? body.token_hash.trim() : ''
+    console.log(`[forgot] incoming email=${email} hash_len=${tokenHash.length}`)
     if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) || !/^[a-f0-9]{64}$/.test(tokenHash)) {
       return json(res, 400, { success: false, error: 'email y token_hash (sha256 hex) son requeridos' })
     }
@@ -672,7 +673,7 @@ async function handle(req, res) {
       try {
       db.prepare('UPDATE password_resets SET usado = 1 WHERE user_id = ?').run(user.id)
       db.prepare('INSERT INTO password_resets (user_id, token_hash, expira) VALUES (?, ?, ?)').run(user.id, tokenHash, expira)
-      console.log(`[forgot] user=${user.id} email=${email} hash=${tokenHash.slice(0, 8)}… expires=${expira}`)
+      console.log(`[forgot] STORED user=${user.id} email=${email} hash=${tokenHash.slice(0, 8)}… expires=${expira}`)
       db.exec('COMMIT')
       } catch (err) {
         try {
@@ -682,6 +683,8 @@ async function handle(req, res) {
         }
         throw err
       }
+    } else {
+      console.log(`[forgot] USER NOT FOUND email=${email}`)
     }
     return json(res, 200, { success: true, message: 'Si el email existe, recibirás un enlace para restablecer tu contraseña.' })
   }
