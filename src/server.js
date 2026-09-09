@@ -46,6 +46,57 @@ try {
   console.warn('   La emisión de licencias no estará disponible hasta configurar LICENSE_PRIVATE_KEY')
 }
 
+// ---------- CORS ----------
+
+const ALLOWED_ORIGINS = [
+  'https://omnimargen.site',
+  'https://www.omnimargen.site',
+  'http://localhost:3000',  // dev
+  'http://localhost:3001',  // dev
+]
+
+function setCorsHeaders(res, origin) {
+  if (ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin)
+    res.setHeader('Vary', 'Origin')
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Admin-Key, X-Api-Key, Stripe-Signature')
+  res.setHeader('Access-Control-Max-Age', '86400')
+}
+
+// ---------- Rate limiting ----------
+
+const RATE_LIMIT_WINDOW_MS = 60_000 // 1 minuto
+const RATE_LIMIT_MAX = 60            // 60 requests por minuto por IP
+const rateLimitMap = new Map()
+let rateLimitCleanupTimer = null
+
+function cleanupRateLimit() {
+  const now = Date.now()
+  for (const [ip, entry] of rateLimitMap) {
+    if (now - entry.start > RATE_LIMIT_WINDOW_MS) rateLimitMap.delete(ip)
+  }
+  if (rateLimitMap.size === 0 && rateLimitCleanupTimer) {
+    clearInterval(rateLimitCleanupTimer)
+    rateLimitCleanupTimer = null
+  }
+}
+
+function isRateLimited(ip) {
+  const now = Date.now()
+  let entry = rateLimitMap.get(ip)
+  if (!entry || now - entry.start > RATE_LIMIT_WINDOW_MS) {
+    entry = { start: now, count: 0 }
+    rateLimitMap.set(ip, entry)
+  }
+  entry.count++
+  if (!rateLimitCleanupTimer) {
+    rateLimitCleanupTimer = setInterval(cleanupRateLimit, RATE_LIMIT_WINDOW_MS)
+  }
+  return entry.count > RATE_LIMIT_MAX
+}
+
 // ---------- utilidades ----------
 
 function readBody(req) {
@@ -355,6 +406,24 @@ async function handle(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`)
   const path = url.pathname
   const method = req.method
+  const origin = req.headers.origin || ''
+  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || ''
+
+  // CORS
+  setCorsHeaders(res, origin)
+
+  // Preflight
+  if (method === 'OPTIONS') {
+    res.writeHead(204)
+    return res.end()
+  }
+
+  // Rate limit (skip health y time)
+  if (path !== '/api/health' && path !== '/api/time') {
+    if (isRateLimited(ip)) {
+      return json(res, 429, { success: false, error: 'Demasiadas solicitudes. Intenta de nuevo en 1 minuto.' })
+    }
+  }
 
   // GET /api/health
   if (method === 'GET' && path === '/api/health') {
