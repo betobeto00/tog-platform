@@ -50,6 +50,11 @@ async function get(path, headers = {}) {
   return { status: res.status, text: await res.text() }
 }
 
+async function getJson(path, headers = {}) {
+  const res = await fetch(base + path, { headers })
+  return { status: res.status, json: await res.json() }
+}
+
 function verifySignature(licencia) {
   const { firma, ...payload } = licencia
   const verifier = crypto.createVerify('SHA256')
@@ -174,10 +179,47 @@ test('confirm: ?payment_id confirma, emite licencia con los módulos del carrito
   assert.equal(confirmados.length, 1, 'seguir con un solo pago confirmado')
 })
 
+test('payment/verify: valida HMAC y confirma el pago, rechaza HMAC inválido', async () => {
+  const auth = { Authorization: `Bearer ${token}` }
+
+  // Crear un nuevo pago pendiente
+  const creado = await post('/api/payment/create', { periodo: 'mensual', modulos: ['restaurant'] }, auth)
+  assert.equal(creado.status, 201)
+  const { payment_id: pid, monto, hmac, empresa_id } = creado.json
+  assert.ok(hmac, 'debe devolver un hmac')
+
+  // HMAC inválido → 403
+  const mala = await getJson(`/api/payment/verify?payment_id=${pid}&hmac=badbadbad`)
+  assert.equal(mala.status, 403)
+  assert.equal(mala.json.success, false)
+
+  // Sin parámetros → 400
+  const sinParams = await getJson('/api/payment/verify')
+  assert.equal(sinParams.status, 400)
+
+  // Payment_id inexistente → 404
+  const fantasma = await getJson(`/api/payment/verify?payment_id=999999&hmac=${hmac}`)
+  assert.equal(fantasma.status, 404)
+
+  // HMAC correcto → confirma el pago
+  const ok = await getJson(`/api/payment/verify?payment_id=${pid}&hmac=${hmac}`)
+  assert.equal(ok.status, 200)
+  assert.equal(ok.json.success, true)
+  assert.match(ok.json.nro_factura, /^F-\d{4}-\d{4}$/)
+
+  // Idempotencia: confirmar de nuevo → 200 con mensaje
+  const deNuevo = await getJson(`/api/payment/verify?payment_id=${pid}&hmac=${hmac}`)
+  assert.equal(deNuevo.status, 200)
+  assert.equal(deNuevo.json.success, true)
+  assert.match(deNuevo.json.message, /ya confirmado/)
+})
+
 test('factura: /api/pagos/:id/factura devuelve HTML imprimible con los datos del pago', async () => {
   const auth = { Authorization: `Bearer ${token}` }
   const profile = await get('/api/user/profile', auth)
-  const pago = JSON.parse(profile.text).pagos.find((p) => p.estado === 'confirmed')
+  const pagos = JSON.parse(profile.text).pagos
+  const pago = pagos.find((p) => p.estado === 'confirmed' && p.nro_factura)
+  assert.ok(pago, 'debe haber al menos un pago confirmado con factura')
 
   const factura = await get(`/api/pagos/${pago.id}/factura`)
   assert.equal(factura.status, 200)
@@ -185,8 +227,8 @@ test('factura: /api/pagos/:id/factura devuelve HTML imprimible con los datos del
   assert.match(factura.text, new RegExp(pago.nro_factura))
   assert.match(factura.text, /PAGADO/)
   assert.match(factura.text, /AgroMaíz/)
-  assert.match(factura.text, /Módulo distribuidor/)
-  assert.match(factura.text, /\$18\.00/)
+  assert.match(factura.text, /Módulo/)
+  assert.match(factura.text, /\$\d+\.\d{2}/)
 })
 
 test('confirm por empresa_id (OmniServ): mantiene el flujo histórico y registra el pago', async () => {

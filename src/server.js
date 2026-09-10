@@ -12,6 +12,7 @@ const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || ''
 const STRIPE_DOMAIN = (process.env.STRIPE_DOMAIN || `http://localhost:${PORT}`).replace(/\/+$/, '')
 const RESEND_API_KEY = process.env.RESEND_API_KEY || ''
 const INVOICE_FROM = process.env.INVOICE_FROM || 'OmniMargen <facturas@omnimargen.site>'
+const PAYMENT_HMAC_SECRET = process.env.PAYMENT_HMAC_SECRET || process.env.JWT_SECRET || 'dev-payment-hmac-secret'
 const MODULOS_COMPRABLES = MODULE_IDS.filter((m) => m !== 'comercializador')
 
 function priceIdFor(modulo) {
@@ -224,6 +225,20 @@ function totalCarrito(periodo, modulos) {
   if (!base) return null
   const extras = precioModulosExtra(periodo, modulos)
   return base + extras
+}
+
+// ---------- HMAC para pagos ----------
+
+function signPaymentHmac(paymentId, monto, empresaId) {
+  const data = `${paymentId}:${monto}:${empresaId}`
+  return crypto.createHmac('sha256', PAYMENT_HMAC_SECRET).update(data).digest('hex')
+}
+
+function verifyPaymentHmac(paymentId, monto, empresaId, hmac) {
+  if (!hmac || typeof hmac !== 'string') return false
+  const expected = signPaymentHmac(paymentId, monto, empresaId)
+  if (hmac.length !== expected.length) return false
+  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(hmac))
 }
 
 // ---------- rutas ----------
@@ -788,6 +803,7 @@ async function handle(req, res) {
       .run(user.id, empresa.id, `tog:${periodo}`, JSON.stringify({ producto: 'tog', periodo, modulos: ['comercializador', ...modulos], desglose }), monto)
     const pagoId = result.lastInsertRowid
 
+    const hmac = signPaymentHmac(pagoId, monto, empresa.id)
     const successUrl = `${req.headers.host ? 'https://' + req.headers.host : 'http://localhost:3001'}/api/payment/confirm?payment_id=${pagoId}`
     return json(res, 201, {
       success: true,
@@ -796,6 +812,7 @@ async function handle(req, res) {
       moneda: 'USD',
       periodo,
       modulos: ['comercializador', ...modulos],
+      hmac,
       success_url: successUrl,
       cancel_url: 'https://omnimargen.site/precios?pago=cancelado',
     })
@@ -816,15 +833,69 @@ async function handle(req, res) {
       .run(user.id, empresa.id, 'omniserv:mensual', JSON.stringify({ producto: 'omniserv', periodo: 'mensual', modulos: ['omniserv'], desglose }), monto)
     const pagoId = result.lastInsertRowid
 
+    const hmac = signPaymentHmac(pagoId, monto, empresa.id)
     const successUrl = `${req.headers.host ? 'https://' + req.headers.host : 'http://localhost:3001'}/api/payment/confirm?payment_id=${pagoId}`
     return json(res, 201, {
       success: true,
       payment_id: pagoId,
       monto,
       moneda: 'USD',
+      hmac,
       success_url: successUrl,
       cancel_url: 'https://omnimargen.site/precios?pago=cancelado',
     })
+  }
+
+  // GET /api/payment/verify — verifica HMAC y confirma el pago
+  if (method === 'GET' && path === '/api/payment/verify') {
+    const paymentId = Number(url.searchParams.get('payment_id'))
+    const hmac = url.searchParams.get('hmac') || ''
+
+    if (!paymentId || !hmac) {
+      return json(res, 400, { success: false, error: 'Parámetros payment_id y hmac requeridos' })
+    }
+
+    const pago = await db.prepare('SELECT * FROM pagos WHERE id = $1').get(paymentId)
+    if (!pago) {
+      return json(res, 404, { success: false, error: 'Pago no encontrado' })
+    }
+
+    if (!verifyPaymentHmac(paymentId, pago.monto, pago.empresa_id, hmac)) {
+      return json(res, 403, { success: false, error: 'HMAC inválido — posible manipulación' })
+    }
+
+    if (pago.estado === 'confirmed') {
+      return json(res, 200, { success: true, message: 'Pago ya confirmado', nro_factura: pago.nro_factura })
+    }
+
+    if (pago.estado !== 'pending') {
+      return json(res, 409, { success: false, error: `Pago en estado '${pago.estado}' — no se puede confirmar` })
+    }
+
+    try {
+      const empresa = await db.prepare('SELECT * FROM empresas WHERE id = $1').get(pago.empresa_id)
+      if (!empresa) throw new Error('Empresa del pago no encontrada')
+
+      const nroFactura = await generarNroFactura()
+      await db.prepare(`UPDATE pagos SET estado = 'confirmed', paid_at = ${NOW}, nro_factura = $1 WHERE id = $2`)
+        .run(nroFactura, pago.id)
+
+      const detalle = (() => { try { return JSON.parse(pago.detalle || '{}') } catch { return {} } })()
+      const modulos = Array.isArray(detalle.modulos) && detalle.modulos.length ? detalle.modulos : ['comercializador']
+      const meses = MESES_POR_PERIODO[detalle.periodo] || 1
+      if (privateKey) {
+        await emitirLicenciaConModulos(empresa, { modulos, por: `crixto:${pago.id}`, meses })
+      }
+
+      const pagoConfirmado = await db.prepare('SELECT * FROM pagos WHERE id = $1').get(pago.id)
+      const user = pago.user_id ? await db.prepare('SELECT * FROM users WHERE id = $1').get(pago.user_id) : null
+      sendInvoiceEmail(pagoConfirmado, empresa, user)
+
+      return json(res, 200, { success: true, nro_factura: nroFactura, message: 'Pago confirmado y licencia activada' })
+    } catch (err) {
+      console.error('[payment/verify]', err)
+      return json(res, 500, { success: false, error: 'Error al confirmar el pago' })
+    }
   }
 
   // GET /api/pagos/:id/factura
