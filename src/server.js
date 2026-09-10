@@ -213,7 +213,7 @@ async function requireUser(req, res) {
 const PRECIOS_TOG = { mensual: 15, trimestral: 40, anual: 150 }
 const EXTRA_MODULO_MENSUAL = 3
 const MESES_POR_PERIODO = { mensual: 1, trimestral: 3, anual: 12 }
-const MODULOS_EXTRA = MODULE_IDS.filter((m) => m !== 'comercializador' && m !== 'omniserv')
+const MODULOS_EXTRA = MODULE_IDS.filter((m) => m !== 'comercializador' && m !== 'omniserv' && m !== 'rrhh')
 
 function precioModulosExtra(periodo, modulos) {
   const meses = MESES_POR_PERIODO[periodo] || 1
