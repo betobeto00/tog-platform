@@ -455,7 +455,7 @@ async function handle(req, res) {
     const apiKey = crypto.randomBytes(16).toString('hex')
     try {
       const result = await db
-        .prepare('INSERT INTO empresas (nombre, pais, documento, email_contacto, api_key) VALUES ($1, $2, $3, $4, $5)')
+        .prepare('INSERT INTO empresas (nombre, pais, documento, email_contacto, api_key) VALUES ($1, $2, $3, $4, $5) RETURNING id')
         .run(nombre, pais, documento, emailContacto, apiKey)
       return json(res, 201, { success: true, id: result.lastInsertRowid, api_key: apiKey })
     } catch (err) {
@@ -533,7 +533,7 @@ async function handle(req, res) {
     const apiKey = crypto.randomBytes(16).toString('hex')
     try {
       const result = await db
-        .prepare('INSERT INTO empresas (nombre, pais, documento, email_contacto, api_key, device_fingerprint, payment_status) VALUES ($1, $2, $3, $4, $5, $6, $7)')
+        .prepare('INSERT INTO empresas (nombre, pais, documento, email_contacto, api_key, device_fingerprint, payment_status) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id')
         .run(nombre, pais, documento, emailContacto, apiKey, deviceFingerprint, 'pending')
       return json(res, 201, { 
         success: true, 
@@ -656,14 +656,14 @@ async function handle(req, res) {
       if (!empresa) {
         const apiKey = crypto.randomBytes(16).toString('hex')
         const result = await db
-          .prepare('INSERT INTO empresas (nombre, pais, documento, email_contacto, api_key) VALUES ($1, $2, $3, $4, $5)')
+          .prepare('INSERT INTO empresas (nombre, pais, documento, email_contacto, api_key) VALUES ($1, $2, $3, $4, $5) RETURNING id')
           .run(nombre, pais, documento, email, apiKey)
         empresa = await db.prepare('SELECT * FROM empresas WHERE id = $1').get(result.lastInsertRowid)
       }
     }
 
     const result = await db
-      .prepare('INSERT INTO users (email, password_hash, nombre, pais, documento, telefono, empresa_id) VALUES ($1, $2, $3, $4, $5, $6, $7)')
+      .prepare('INSERT INTO users (email, password_hash, nombre, pais, documento, telefono, empresa_id) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id')
       .run(email, hashPassword(password), nombre, pais, documento, telefono || null, empresa?.id || null)
     const user = await db.prepare('SELECT id, email, nombre, pais, documento, telefono, empresa_id, created_at FROM users WHERE id = $1').get(result.lastInsertRowid)
     return json(res, 201, { success: true, token: signToken({ uid: user.id }), user })
@@ -784,7 +784,7 @@ async function handle(req, res) {
     for (const m of modulos) desglose.push({ modulo: `Módulo ${m}`, precio: EXTRA_MODULO_MENSUAL * MESES_POR_PERIODO[periodo] })
 
     const result = await db
-      .prepare("INSERT INTO pagos (user_id, empresa_id, concepto, detalle, monto, moneda, estado, provider) VALUES ($1, $2, $3, $4, $5, 'USD', 'pending', 'crixto')")
+      .prepare("INSERT INTO pagos (user_id, empresa_id, concepto, detalle, monto, moneda, estado, provider) VALUES ($1, $2, $3, $4, $5, 'USD', 'pending', 'crixto') RETURNING id")
       .run(user.id, empresa.id, `tog:${periodo}`, JSON.stringify({ producto: 'tog', periodo, modulos: ['comercializador', ...modulos], desglose }), monto)
     const pagoId = result.lastInsertRowid
 
@@ -812,7 +812,7 @@ async function handle(req, res) {
     const desglose = [{ modulo: 'OmniServ — mensual', precio: monto }]
 
     const result = await db
-      .prepare("INSERT INTO pagos (user_id, empresa_id, concepto, detalle, monto, moneda, estado, provider) VALUES ($1, $2, $3, $4, $5, 'USD', 'pending', 'crixto')")
+      .prepare("INSERT INTO pagos (user_id, empresa_id, concepto, detalle, monto, moneda, estado, provider) VALUES ($1, $2, $3, $4, $5, 'USD', 'pending', 'crixto') RETURNING id")
       .run(user.id, empresa.id, 'omniserv:mensual', JSON.stringify({ producto: 'omniserv', periodo: 'mensual', modulos: ['omniserv'], desglose }), monto)
     const pagoId = result.lastInsertRowid
 
