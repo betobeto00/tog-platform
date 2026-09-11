@@ -6,13 +6,26 @@ import { signLicense, loadPrivateKey, MODULE_IDS } from './sign.js'
 import { createCheckoutSession, createStripeCustomer, verifyStripeWebhook } from './stripe.js'
 
 const PORT = Number(process.env.PORT || 3001)
-const ADMIN_API_KEY = process.env.ADMIN_API_KEY || 'dev-admin-key'
 const PRIVATE_KEY_PATH = process.env.LICENSE_PRIVATE_KEY_PATH || './keys/private.key'
-const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || ''
 const STRIPE_DOMAIN = (process.env.STRIPE_DOMAIN || `http://localhost:${PORT}`).replace(/\/+$/, '')
+
+// --- Validación de secrets obligatorios ---
+const REQUIRED_ENV = {
+  ADMIN_API_KEY: process.env.ADMIN_API_KEY,
+  PAYMENT_HMAC_SECRET: process.env.PAYMENT_HMAC_SECRET,
+}
+const missing = Object.entries(REQUIRED_ENV).filter(([, v]) => !v).map(([k]) => k)
+if (missing.length > 0) {
+  console.error(`\n❌ Falta variable de entorno obligatoria: ${missing.join(', ')}`)
+  console.error('   Define las env vars antes de arrancar el servidor.')
+  process.exit(1)
+}
+
+const ADMIN_API_KEY = REQUIRED_ENV.ADMIN_API_KEY
+const PAYMENT_HMAC_SECRET = REQUIRED_ENV.PAYMENT_HMAC_SECRET
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || ''
 const RESEND_API_KEY = process.env.RESEND_API_KEY || ''
 const INVOICE_FROM = process.env.INVOICE_FROM || 'OmniMargen <facturas@omnimargen.site>'
-const PAYMENT_HMAC_SECRET = process.env.PAYMENT_HMAC_SECRET || process.env.JWT_SECRET || 'dev-payment-hmac-secret'
 const MODULOS_COMPRABLES = MODULE_IDS.filter((m) => m !== 'comercializador')
 
 function priceIdFor(modulo) {
@@ -49,11 +62,11 @@ try {
 
 // ---------- CORS ----------
 
+const isDev = process.env.NODE_ENV !== 'production'
 const ALLOWED_ORIGINS = [
   'https://omnimargen.site',
   'https://www.omnimargen.site',
-  'http://localhost:3000',  // dev
-  'http://localhost:3001',  // dev
+  ...(isDev ? ['http://localhost:3000', 'http://localhost:3001'] : []),
 ]
 
 function setCorsHeaders(res, origin) {
@@ -283,6 +296,15 @@ async function emitirLicencia(empresa, { modulo, por, meses = 1 }) {
   return emitirLicenciaConModulos(empresa, { modulos: [modulo], por, meses })
 }
 
+async function revocarLicencia(empresaId, { por, motivo = 'subscription_cancelled' } = {}) {
+  const licencia = await db.prepare('SELECT id FROM licencias WHERE empresa_id = $1 ORDER BY issued_at DESC LIMIT 1').get(empresaId)
+  if (!licencia) return null
+  await db.prepare(
+    `UPDATE licencias SET revoked_at = ${NOW}, motivo_revocado = $1 WHERE id = $2`
+  ).run(motivo, licencia.id)
+  return licencia.id
+}
+
 // ---------- facturas / recibos ----------
 
 async function generarNroFactura() {
@@ -405,7 +427,12 @@ async function procesarCheckout(event) {
   if (session?.customer) {
     await db.prepare('UPDATE empresas SET stripe_customer_id = $1 WHERE id = $2').run(session.customer, empresa.id)
   }
-  await emitirLicencia(empresa, { modulo, por: `stripe:${event.id}` })
+  try {
+    await emitirLicencia(empresa, { modulo, por: `stripe:${event.id}` })
+  } catch (err) {
+    console.error(`[webhook] emitirLicencia falló para empresa ${empresa.id}, módulo ${modulo}:`, err.message)
+    throw err
+  }
 
   const subId = session?.subscription ? String(session.subscription) : null
   if (subId) {
@@ -474,7 +501,7 @@ async function handle(req, res) {
         .run(nombre, pais, documento, emailContacto, apiKey)
       return json(res, 201, { success: true, id: result.lastInsertRowid, api_key: apiKey })
     } catch (err) {
-      return json(res, 409, { success: false, error: `Documento duplicado para el país ${pais}: ${err.message}` })
+      return json(res, 409, { success: false, error: `Documento duplicado para el país ${pais}` })
     }
   }
 
@@ -558,7 +585,7 @@ async function handle(req, res) {
         } 
       })
     } catch (err) {
-      return json(res, 500, { success: false, error: `Error al registrar: ${err.message}` })
+      return json(res, 500, { success: false, error: 'Error al registrar empresa' })
     }
   }
 
@@ -942,7 +969,7 @@ async function handle(req, res) {
     try {
       license = signLicense(privateKey, { cliente, expira, machineId: machine_id, modules, maxPcs: max_pcs })
     } catch (err) {
-      return json(res, 400, { success: false, error: err.message })
+      return json(res, 400, { success: false, error: 'Error al firmar la licencia' })
     }
 
     await db.prepare(
@@ -1058,7 +1085,7 @@ async function handle(req, res) {
       })
       return json(res, 201, { success: true, url: session.url })
     } catch (err) {
-      return json(res, 502, { success: false, error: err.message })
+      return json(res, 502, { success: false, error: 'Error al crear sesión de pago' })
     }
   }
 
@@ -1086,7 +1113,7 @@ async function handle(req, res) {
     try {
       verifyStripeWebhook({ secret: STRIPE_WEBHOOK_SECRET, rawBody: raw, signatureHeader: req.headers['stripe-signature'] })
     } catch (err) {
-      return json(res, 400, { success: false, error: err.message })
+      return json(res, 400, { success: false, error: 'Firma del webhook inválida' })
     }
     let event
     try {
@@ -1107,7 +1134,11 @@ async function handle(req, res) {
         } else if (event.type === 'customer.subscription.deleted') {
           const sub = event?.data?.object
           if (sub?.id) {
+            const subRecord = await db.prepare('SELECT empresa_id FROM suscripciones WHERE stripe_subscription_id = $1').get(String(sub.id))
             await db.prepare("UPDATE suscripciones SET estado = 'cancelado', cancel_at_period_end = TRUE WHERE stripe_subscription_id = $1").run(String(sub.id))
+            if (subRecord?.empresa_id) {
+              await revocarLicencia(subRecord.empresa_id, { por: `stripe:${event.id}`, motivo: 'subscription_cancelled' })
+            }
           }
         } else if (event.type === 'invoice.payment_failed') {
           const invoice = event?.data?.object
@@ -1146,7 +1177,7 @@ async function handle(req, res) {
         await db.exec('ROLLBACK')
       } catch {}
       console.error('[webhook] error procesando evento', event?.type, err.message)
-      return json(res, 500, { success: false, error: err.message })
+      return json(res, 500, { success: false, error: 'Error al procesar el evento' })
     }
   }
 
@@ -1157,7 +1188,7 @@ export function startServer({ port = PORT } = {}) {
   const server = http.createServer((req, res) => {
     handle(req, res).catch((err) => {
       console.error(err)
-      json(res, 500, { success: false, error: err.message })
+      json(res, 500, { success: false, error: 'Error interno del servidor' })
     })
   })
 
