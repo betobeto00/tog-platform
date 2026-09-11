@@ -123,7 +123,7 @@ Pensada para活在 en SQLite de la Base cuando se implemente:
 
 ✅ **Primera fase implementada y testeada** (tog-admin + tog-platform):
 
-- **Migración 032** en tog-admin: tablas `pcs_enlazadas`, `sesiones_activas`,
+- **Migración 031** en tog-admin: tablas `pcs_enlazadas`, `sesiones_activas`,
   `codigos_enlace` (SQLite de la Base).
 - **PC Base**: servidor HTTP local `:3002` dentro del main process
   (`src/main/services/red-server.ts`, Node `http`, cero deps). Endpoints:

@@ -22,7 +22,7 @@ Cada eslabón es un **módulo** que se activa/desactiva según lo que el cliente
 
 | Producto | Repo | Estado |
 |----------|------|--------|
-| **TOG Admin** (módulo Comercializador) | [`betobeto00/tog-admin`](https://github.com/betobeto00/tog-admin) | ✅ v1.0.8 |
+| **TOG Admin** (módulo Comercializador) | [`betobeto00/tog-admin`](https://github.com/betobeto00/tog-admin) | ✅ v1.2.0 |
 | **Landing OmniMargen** | [`betobeto00/landing-page`](https://github.com/betobeto00/landing-page) | ✅ Producción |
 | **TOG Platform** (este repo) | [`betobeto00/tog-platform`](https://github.com/betobeto00/tog-platform) | ⚙️ Backend MVP + docs |
 

@@ -2,7 +2,7 @@
 
 > Documento técnico de la integración entre **pagos (Stripe)** y **licencias (TOG Platform)**. El flujo de licenciamiento puro está en `MODULOS.md`; la arquitectura modular está en `ARQUITECTURA-MODULAR.md`. Este doc los conecta.
 >
-> 🅿️ **Estado (2-Sep-2026): EN ESPERA** — decisión de alcance anti-overengineering (ver `README.md` → “Qué es HOY… y qué está EN ESPERA”). Lo descrito aquí es el **diseño** del flujo online; la implementación real (Node + SQLite, cero dependencias: `src/server.js`, `src/stripe.js`, webhooks idempotentes con grace period) ya existe y tiene 19 tests, pero **no se avanza** (Customer Portal, emails, panel web) hasta que un cliente quiera pagar online. Hoy se opera con el flujo manual + botón Sincronizar.
+> 🅿️ **Estado (10-Sep-2026): EN ESPERA** — decisión de alcance anti-overengineering (ver `README.md` → “Qué es HOY… y qué está EN ESPERA”). Lo descrito aquí es el **diseño** del flujo online; la implementación real (Node + SQLite, cero dependencias: `src/server.js`, `src/stripe.js`, webhooks idempotentes con grace period) ya existe y tiene 35+ tests (account, server, stripe), pero **no se avanza** (Customer Portal, emails, panel web) hasta que un cliente quiera pagar online. Hoy se opera con el flujo manual + botón Sincronizar.
 
 ---
 

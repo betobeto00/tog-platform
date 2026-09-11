@@ -2,7 +2,7 @@
 
 > Documento técnico. Define cómo el Core carga módulos activados por licencia, cómo se comunican los módulos entre sí, cómo el Sidebar/Route/IPC reaccionan, y qué cambios concretos requiere el código actual de TOG Admin.
 >
-> 📌 **Estado real (4-Sep-2026):** este documento es la **visión de diseño** de un cargador genérico (loader/registry/manifiesto). La implementación real es más liviana y vive en **`tog-admin`**: handlers por módulo en `src/main/modules/<módulo>/`, catálogo en `src/shared/modules.ts`, gating con `useActiveModules` (licencia) + `usePermissions` (permisos) en el renderer y `checkPermissionOrFail` en el main — ver `tog-admin/docs/ARCHITECTURE.md`. Hoy el único módulo activable por licencia es **Distribuidor** (clientes + pedidos); Comercializador es el Core (incluye catálogo con producto/servicio, subcategorías/marca/imagen y venta a crédito con abonos).
+> 📌 **Estado real (10-Sep-2026):** este documento es la **visión de diseño** de un cargador genérico (loader/registry/manifiesto). La implementación real es más liviana y vive en **`tog-admin`**: handlers por módulo en `src/main/modules/<módulo>/` (15 módulos), catálogo en `src/shared/modules.ts`, gating con `useActiveModules` (licencia) + `usePermissions` (permisos) en el renderer y `checkPermissionOrFail` en el main — ver `tog-admin/docs/ARCHITECTURE.md`. Módulos activables por licencia: **Distribuidor**, **Restaurant**, **Administración/Contable**, **Recursos Humanos**, **Productor**, **Postventa**, **Red Local**. Comercializador es el Core (incluye catálogo con producto/servicio, subcategorías/marca/imagen y venta a crédito con abonos).
 
 ---
 
@@ -217,7 +217,7 @@ El Sidebar lee el mismo `activeModules` y filtra items por permisos.
 
 ## 7. Permisos por módulo
 
-El catálogo de permisos ya existe (`src/shared/permissions.ts`, 28 permisos en 7 categorías). El cambio: cada **módulo declara los suyos** y el Core los agrega al catálogo al activarlo.
+El catálogo de permisos ya existe (`src/shared/permissions.ts`, 57 permisos en 11 categorías). El cambio: cada **módulo declara los suyos** y el Core los agrega al catálogo al activarlo.
 
 ```ts
 // Ejemplo: módulo Distribuidor
@@ -230,9 +230,7 @@ export const permissions: PermissionDef[] = [
 ]
 ```
 
-**Bug crítico a corregir en el camino**: hoy `permissions.ts` está en el backend pero **no se invoca** en los IPC handlers. Cualquier cliente IPC bypasea permisos. Mientras esto siga así, modularizar permisos no tiene sentido.
-
-Acción inmediata: hacer que `requirePermission('key')` envuelva cada handler de venta/caja/productos, y que cada módulo lo haga con sus propias keys.
+**Estado (10-Sep-2026): RESUELTO.** `checkPermissionOrFail` se invoca en 42+ archivos de handlers en todos los módulos. El admin tiene todas las claves (`ROLE_DEFAULTS.admin`). Cada handler valida permisos antes de ejecutar lógica de negocio.
 
 ---
 
@@ -283,13 +281,13 @@ Eventos típicos:
 ## 10. Plan de migración del código actual
 
 ### Fase 1 (corto plazo): sentar las bases
-1. Mover `src/main/ipc-handlers.ts` (1578 líneas) a `src/main/core/ipc-handlers.ts` y partirlo por dominio:
+1. ~~Mover `src/main/ipc-handlers.ts` (1578 líneas)~~ **HECHO**: el archivo fue refactorizado en módulos separados (`src/main/modules/<módulo>/`); `ipc-handlers.ts` ahora es solo el punto de registro (93 líneas) que llama a cada `register*Handlers()`.
    - `core/ipc-handlers/auth.ts`
    - `core/ipc-handlers/config.ts`
    - `core/ipc-handlers/license.ts`
 2. Crear `src/main/core/modules/` con `loader.ts`, `module-api.ts`, `registry.ts`.
 3. Definir `ModuleManifest`, `ModuleContext`, `EventBus` en `src/shared/modules.ts`.
-4. **Conectar `requirePermission` a TODOS los handlers actuales** (bug crítico de seguridad).
+4. ~~**Conectar `requirePermission` a TODOS los handlers actuales**~~ **HECHO**: `checkPermissionOrFail` se usa en 42+ archivos de handlers.
 5. Exponer `window.api.modules = { comercializador: true, ... }` desde el preload.
 6. Hacer que `App.tsx` y `Sidebar` lean de `window.api.modules`.
 
@@ -364,7 +362,7 @@ Para el caso nube:
 | Tablas comunes siempre creadas | 🟡 Decidido (v1) | Migrar a "tablas del módulo" si crece |
 | Comunicación entre módulos vía eventos | 🟡 Diseñado | Event bus en `ModuleContext` |
 | Modo nube = mismo código, `IDataSource` distinto | 🟡 Diseñado | Sin reescritura cuando se active |
-| **Bug crítico a corregir YA** | 🔴 Pendiente | `requirePermission` debe envolver TODOS los IPC handlers |
+| **Bug crítico de permisos** | ✅ Resuelto | `checkPermissionOrFail` se usa en 42+ archivos de handlers |
 
 ---
 
