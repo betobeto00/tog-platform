@@ -70,6 +70,19 @@ test('server exits with error when PAYMENT_HMAC_SECRET is missing', async () => 
 })
 
 // ============================================================
+// Test 2b: Server no arranca sin JWT_SECRET
+// ============================================================
+test('server exits with error when JWT_SECRET is missing', async () => {
+  const serverContent = await import('node:fs').then(fs => 
+    fs.readFileSync(join(process.cwd(), 'src', 'server.js'), 'utf8')
+  )
+  
+  // Verify that JWT_SECRET is required (no fallback)
+  assert.ok(serverContent.includes("JWT_SECRET: process.env.JWT_SECRET"), 'JWT_SECRET should be read from env')
+  assert.ok(!serverContent.includes("'dev-jwt-secret'"), 'Should not have hardcoded fallback')
+})
+
+// ============================================================
 // Test 3: Server no arranca sin ambas variables
 // ============================================================
 test('server has startup validation for required env vars', async () => {

@@ -13,6 +13,7 @@ const tmpDir = mkdtempSync(join(tmpdir(), 'tog-platform-stripe-'))
 process.env.TOG_PLATFORM_DATA = join(tmpDir, 'data')
 process.env.ADMIN_API_KEY = 'stripe-admin-key'
 process.env.PAYMENT_HMAC_SECRET = 'test-hmac-secret'
+process.env.JWT_SECRET = 'test-jwt-secret'
 process.env.STRIPE_SECRET_KEY = 'sk_test_fake'
 process.env.STRIPE_WEBHOOK_SECRET = 'whsec_test_1234567890'
 process.env.STRIPE_PRICE_DISTRIBUIDOR = 'price_distribuidor'

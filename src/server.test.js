@@ -15,6 +15,7 @@ const tmpDir = mkdtempSync(join(tmpdir(), 'tog-platform-'))
 process.env.TOG_PLATFORM_DATA = join(tmpDir, 'data')
 process.env.ADMIN_API_KEY = 'test-admin-key'
 process.env.PAYMENT_HMAC_SECRET = 'test-hmac-secret'
+process.env.JWT_SECRET = 'test-jwt-secret'
 
 const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 })
 const keyPath = join(tmpDir, 'private.pem')

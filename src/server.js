@@ -13,6 +13,7 @@ const STRIPE_DOMAIN = (process.env.STRIPE_DOMAIN || `http://localhost:${PORT}`).
 const REQUIRED_ENV = {
   ADMIN_API_KEY: process.env.ADMIN_API_KEY,
   PAYMENT_HMAC_SECRET: process.env.PAYMENT_HMAC_SECRET,
+  JWT_SECRET: process.env.JWT_SECRET,
 }
 const missing = Object.entries(REQUIRED_ENV).filter(([, v]) => !v).map(([k]) => k)
 if (missing.length > 0) {
@@ -164,7 +165,7 @@ async function requireEmpresa(req, res) {
 
 // ---------- cuenta web: password (scrypt) + tokens (HMAC-SHA256) ----------
 
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-jwt-secret'
+const JWT_SECRET = REQUIRED_ENV.JWT_SECRET
 
 function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString('hex')
@@ -390,6 +391,54 @@ async function sendInvoiceEmail(pago, empresa, user) {
   }
 }
 
+async function sendEmail({ to, subject, html }) {
+  if (!RESEND_API_KEY || !to) return
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: INVOICE_FROM, to: [to], subject, html }),
+    })
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '')
+      console.error(`[email] Resend ${res.status}: ${detail}`)
+    }
+  } catch (err) {
+    console.error('[email] Error enviando email:', err?.message || err)
+  }
+}
+
+function htmlWelcome(user, empresa) {
+  return `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Bienvenido a OmniMargen</title></head>
+<body style="font-family:sans-serif;max-width:560px;margin:40px auto;color:#222">
+<h1 style="color:#16a34a">Bienvenido a OmniMargen</h1>
+<p>Hola <strong>${user.nombre || 'Usuario'}</strong>,</p>
+<p>Tu cuenta fue creada exitosamente.</p>
+${empresa ? `<p><strong>Empresa:</strong> ${empresa.nombre} (${empresa.pais}-${empresa.documento})</p>
+<p>Tu empresa ya está lista. Desde la app <strong>TOG Admin</strong> o <strong>OmniServ</strong> podés sincronizar tu licencia con estos datos:</p>
+<ul>
+  <li><strong>País:</strong> ${empresa.pais}</li>
+  <li><strong>Documento:</strong> ${empresa.documento}</li>
+  <li><strong>API Key:</strong> <code>${empresa.api_key}</code></li>
+</ul>` : '<p>No vinculaste una empresa. Podés hacerlo más tarde desde tu cuenta.</p>'}
+<p style="margin-top:24px"><a href="https://omnimargen.site/cuenta" style="background:#16a34a;color:#fff;padding:10px 20px;border-radius:6px;text-decoration:none;display:inline-block">Ir a mi cuenta</a></p>
+<p style="color:#666;margin-top:32px;font-size:13px">Si no creaste esta cuenta, podés ignorar este mensaje.</p>
+</body></html>`
+}
+
+function htmlRenewalReminder(user, empresa, diasRestantes) {
+  const urgenStyle = diasRestantes <= 7 ? 'color:#dc2626;font-weight:bold' : 'color:#d97706'
+  return `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Tu licencia vence pronto</title></head>
+<body style="font-family:sans-serif;max-width:560px;margin:40px auto;color:#222">
+<h1 style="${urgenStyle}">Tu licencia vence en ${diasRestantes} día${diasRestantes === 1 ? '' : 's'}</h1>
+<p>Hola <strong>${user.nombre || 'Usuario'}</strong>,</p>
+${empresa ? `<p>La licencia de <strong>${empresa.nombre}</strong> vence el <strong>${empresa.fecha_expiracion || 'próximamente'}</strong>.</p>` : ''}
+<p>Para evitar la interrupción del servicio, renová tu licencia desde la app o desde tu cuenta web.</p>
+<p style="margin-top:24px"><a href="https://omnimargen.site/cuenta" style="background:#16a34a;color:#fff;padding:10px 20px;border-radius:6px;text-decoration:none;display:inline-block">Renovar ahora</a></p>
+<p style="color:#666;margin-top:32px;font-size:13px">Si ya renovaste, podés ignorar este mensaje.</p>
+</body></html>`
+}
+
 async function revocarImpagosVencidos() {
   const hoy = new Date().toISOString().split('T')[0]
   const vencidas = await db
@@ -410,6 +459,30 @@ async function revocarImpagosVencidos() {
       await db.exec('ROLLBACK')
     } catch {}
     throw err
+  }
+}
+
+let lastRenewalReminderDay = ''
+async function enviarRecordatoriosRenovacion() {
+  const hoy = new Date().toISOString().split('T')[0]
+  if (lastRenewalReminderDay === hoy) return
+  lastRenewalReminderDay = hoy
+  const en7dias = new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0]
+  const en3dias = new Date(Date.now() + 3 * 86400000).toISOString().split('T')[0]
+  const porVencer = await db.prepare(
+    `SELECT l.empresa_id, l.expira, e.nombre, e.email_contacto
+     FROM licencias l JOIN empresas e ON e.id = l.empresa_id
+     WHERE l.revoked_at IS NULL AND l.expira IN ($1, $2)`
+  ).all(en7dias, en3dias)
+  for (const lic of porVencer) {
+    if (!lic.email_contacto) continue
+    const diasRestantes = Math.ceil((new Date(lic.expira) - Date.now()) / 86400000)
+    const user = await db.prepare('SELECT nombre FROM users WHERE empresa_id = $1 LIMIT 1').get(lic.empresa_id)
+    await sendEmail({
+      to: lic.email_contacto,
+      subject: `Tu licencia vence en ${diasRestantes} día${diasRestantes === 1 ? '' : 's'} — OmniMargen`,
+      html: htmlRenewalReminder(user || { nombre: lic.email_contacto }, { nombre: lic.nombre, fecha_expiracion: lic.expira }, diasRestantes),
+    }).catch(() => {})
   }
 }
 
@@ -600,8 +673,8 @@ async function handle(req, res) {
       if (paymentId) {
         const pago = await db.prepare('SELECT * FROM pagos WHERE id = $1').get(Number(paymentId))
         if (!pago) {
-          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-          res.end(paginaSimple('Error', 'Pago no encontrado'))
+          res.writeHead(302, { Location: 'https://omnimargen.site/pago-cancelado' })
+          res.end()
           return
         }
         const empresa = await db.prepare('SELECT * FROM empresas WHERE id = $1').get(pago.empresa_id)
@@ -625,17 +698,9 @@ async function handle(req, res) {
           const pagoConfirmado = await db.prepare('SELECT * FROM pagos WHERE id = $1').get(pago.id)
           const user = pago.user_id ? await db.prepare('SELECT * FROM users WHERE id = $1').get(pago.user_id) : null
           sendInvoiceEmail(pagoConfirmado, empresa, user)
-          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-          res.end(
-            paginaSimple(
-              '✅ Pago Confirmado',
-              `Tu licencia fue activada (factura ${nroFactura}). <a href="/api/pagos/${pago.id}/factura">Ver recibo y factura</a> · vuelve a <a href="https://omnimargen.site/cuenta">tu cuenta</a>.`,
-            ),
-          )
-        } else {
-          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-          res.end(paginaSimple('✅ Pago Confirmado', 'Este pago ya había sido confirmado.'))
         }
+        res.writeHead(302, { Location: 'https://omnimargen.site/pago-exitoso' })
+        res.end()
         return
       }
 
@@ -654,14 +719,13 @@ async function handle(req, res) {
           const user = await db.prepare('SELECT * FROM users WHERE empresa_id = $1').get(empresa.id)
           sendInvoiceEmail(pago, empresa, user)
         }
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-        res.end(paginaSimple('✅ Pago Confirmado', 'Tu licencia ha sido activada. Vuelve a la app y presiona "Verificar Pago".'))
+        res.writeHead(302, { Location: 'https://omnimargen.site/pago-exitoso' })
+        res.end()
         return
       }
 
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-      res.end(paginaSimple('✅ Pago exitoso', 'Gracias por tu pago. Vuelve a <a href="https://omnimargen.site/cuenta">tu cuenta OmniMargen</a> para ver tus servicios activos y tus facturas.'))
-      return
+      res.writeHead(302, { Location: 'https://omnimargen.site/pago-exitoso' })
+      res.end()
     } catch (err) {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       res.end(paginaSimple('Error', 'Error al procesar el pago. Contacta soporte.'))
@@ -708,6 +772,7 @@ async function handle(req, res) {
       .prepare('INSERT INTO users (email, password_hash, nombre, pais, documento, telefono, empresa_id) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id')
       .run(email, hashPassword(password), nombre, pais, documento, telefono || null, empresa?.id || null)
     const user = await db.prepare('SELECT id, email, nombre, pais, documento, telefono, empresa_id, created_at FROM users WHERE id = $1').get(result.lastInsertRowid)
+    sendEmail({ to: email, subject: 'Bienvenido a OmniMargen', html: htmlWelcome(user, empresa) }).catch(() => {})
     return json(res, 201, { success: true, token: signToken({ uid: user.id }), user })
   }
 
@@ -841,7 +906,7 @@ async function handle(req, res) {
       modulos: ['comercializador', ...modulos],
       hmac,
       success_url: successUrl,
-      cancel_url: 'https://omnimargen.site/precios?pago=cancelado',
+      cancel_url: 'https://omnimargen.site/pago-cancelado',
     })
   }
 
@@ -869,7 +934,7 @@ async function handle(req, res) {
       moneda: 'USD',
       hmac,
       success_url: successUrl,
-      cancel_url: 'https://omnimargen.site/precios?pago=cancelado',
+      cancel_url: 'https://omnimargen.site/pago-cancelado',
     })
   }
 
@@ -998,6 +1063,11 @@ async function handle(req, res) {
       await revocarImpagosVencidos()
     } catch (err) {
       console.error('[licencia] error al barrer impagos vencidos', err.message)
+    }
+    try {
+      await enviarRecordatoriosRenovacion()
+    } catch (err) {
+      console.error('[licencia] error al enviar recordatorios de renovación', err.message)
     }
     
     const deviceFingerprint = String(req.headers['x-device-fingerprint'] || url.searchParams.get('device_fingerprint') || '').trim()

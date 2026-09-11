@@ -12,6 +12,7 @@ const tmpDir = mkdtempSync(join(tmpdir(), 'tog-platform-account-'))
 process.env.TOG_PLATFORM_DATA = join(tmpDir, 'data')
 process.env.ADMIN_API_KEY = 'test-admin-key'
 process.env.PAYMENT_HMAC_SECRET = 'test-hmac-secret'
+process.env.JWT_SECRET = 'test-jwt-secret'
 
 const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 })
 const keyPath = join(tmpDir, 'private.pem')
@@ -47,8 +48,8 @@ async function post(path, body, headers = {}) {
 }
 
 async function get(path, headers = {}) {
-  const res = await fetch(base + path, { headers })
-  return { status: res.status, text: await res.text() }
+  const res = await fetch(base + path, { headers, redirect: 'manual' })
+  return { status: res.status, text: await res.text(), headers: Object.fromEntries(res.headers) }
 }
 
 async function getJson(path, headers = {}) {
@@ -155,9 +156,8 @@ test('confirm: ?payment_id confirma, emite licencia con los módulos del carrito
   const paymentId = creado.json.payment_id
 
   const confirm = await get(`/api/payment/confirm?payment_id=${paymentId}`)
-  assert.equal(confirm.status, 200)
-  assert.match(confirm.text, /Pago Confirmado/)
-  assert.match(confirm.text, /factura F-\d{4}-\d{4}/)
+  assert.equal(confirm.status, 302)
+  assert.equal(confirm.headers.location, 'https://omnimargen.site/pago-exitoso')
 
   const profile = await get('/api/user/profile', auth)
   const body = JSON.parse(profile.text)
@@ -171,9 +171,9 @@ test('confirm: ?payment_id confirma, emite licencia con los módulos del carrito
   assert.equal(pagoConfirmado.estado, 'confirmed')
   assert.match(pagoConfirmado.nro_factura, /^F-\d{4}-\d{4}$/)
 
-  // Idempotencia: confirmar de nuevo no emite otra licencia
+  // Idempotencia: confirmar de nuevo redirige igualmente
   const deNuevo = await get(`/api/payment/confirm?payment_id=${paymentId}`)
-  assert.match(deNuevo.text, /ya había sido confirmado/)
+  assert.equal(deNuevo.status, 302)
 
   const profile2 = await get('/api/user/profile', auth)
   const confirmados = JSON.parse(profile2.text).pagos.filter((p) => p.estado === 'confirmed')
@@ -240,8 +240,8 @@ test('confirm por empresa_id (OmniServ): mantiene el flujo histórico y registra
   const empresaId = empresa.json.id
 
   const confirm = await get(`/api/payment/confirm?empresa_id=${empresaId}`)
-  assert.equal(confirm.status, 200)
-  assert.match(confirm.text, /Verificar Pago/)
+  assert.equal(confirm.status, 302)
+  assert.equal(confirm.headers.location, 'https://omnimargen.site/pago-exitoso')
 
   const status = await get(`/api/empresas/${empresaId}/payment-status`, {
     'x-api-key': empresa.json.api_key,
@@ -254,10 +254,10 @@ test('confirm por empresa_id (OmniServ): mantiene el flujo histórico y registra
   assert.equal(JSON.parse(licencia.text).licencia.modules.includes('omniserv'), true)
 })
 
-test('confirm sin parámetros: página genérica de éxito (URL fija del panel de Crixto)', async () => {
+test('confirm sin parámetros: redirige a pago-exitoso', async () => {
   const res = await get('/api/payment/confirm')
-  assert.equal(res.status, 200)
-  assert.match(res.text, /Pago exitoso/)
+  assert.equal(res.status, 302)
+  assert.equal(res.headers.location, 'https://omnimargen.site/pago-exitoso')
 })
 
 test('forgot + reset-password: cambia la contraseña con un token válido', async () => {
