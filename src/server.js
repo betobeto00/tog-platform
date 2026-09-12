@@ -26,7 +26,7 @@ const ADMIN_API_KEY = REQUIRED_ENV.ADMIN_API_KEY
 const PAYMENT_HMAC_SECRET = REQUIRED_ENV.PAYMENT_HMAC_SECRET
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || ''
 const RESEND_API_KEY = process.env.RESEND_API_KEY || ''
-const INVOICE_FROM = process.env.INVOICE_FROM || 'OmniMargen <facturas@omnimargen.site>'
+const INVOICE_FROM = process.env.INVOICE_FROM || 'OmniMargen <facturas@mail.omnimargen.site>'
 const MODULOS_COMPRABLES = MODULE_IDS.filter((m) => m !== 'comercializador')
 
 function priceIdFor(modulo) {
