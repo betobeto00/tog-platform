@@ -789,6 +789,17 @@ async function handle(req, res) {
     return json(res, 200, { success: true, token: signToken({ uid: user.id }), user: publico })
   }
 
+  // POST /api/auth/check-email (public) - check if email exists without login
+  if (method === 'POST' && path === '/api/auth/check-email') {
+    const body = await readBody(req)
+    const email = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : ''
+    if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+      return json(res, 400, { success: false, error: 'email inválido' })
+    }
+    const user = await db.prepare('SELECT id FROM users WHERE email = $1').get(email)
+    return json(res, 200, { success: true, exists: !!user })
+  }
+
   // POST /api/auth/forgot
   if (method === 'POST' && path === '/api/auth/forgot') {
     const body = await readBody(req)
