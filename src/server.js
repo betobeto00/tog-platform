@@ -3,11 +3,19 @@ import crypto from 'node:crypto'
 import { pathToFileURL } from 'node:url'
 import { db, getActiveLicense, closeDatabase, NOW } from './db.js'
 import { signLicense, loadPrivateKey, MODULE_IDS } from './sign.js'
-import { createCheckoutSession, createStripeCustomer, verifyStripeWebhook } from './stripe.js'
+import {
+  cifrar,
+  descifrar,
+  generateBackupCodes,
+  generateTOTPSecret,
+  hashBackupCode,
+  otpauthUri,
+  verifyTOTP,
+} from './totp.js'
 
 const PORT = Number(process.env.PORT || 3001)
 const PRIVATE_KEY_PATH = process.env.LICENSE_PRIVATE_KEY_PATH || './keys/private.key'
-const STRIPE_DOMAIN = (process.env.STRIPE_DOMAIN || `http://localhost:${PORT}`).replace(/\/+$/, '')
+const SITE_URL = (process.env.SITE_URL || 'https://omnimargen.site').replace(/\/+$/, '')
 
 // --- Validación de secrets obligatorios ---
 const REQUIRED_ENV = {
@@ -24,28 +32,34 @@ if (missing.length > 0) {
 
 const ADMIN_API_KEY = REQUIRED_ENV.ADMIN_API_KEY
 const PAYMENT_HMAC_SECRET = REQUIRED_ENV.PAYMENT_HMAC_SECRET
-const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || ''
 const RESEND_API_KEY = process.env.RESEND_API_KEY || ''
 const INVOICE_FROM = process.env.INVOICE_FROM || 'OmniMargen <facturas@mail.omnimargen.site>'
-const MODULOS_COMPRABLES = MODULE_IDS.filter((m) => m !== 'comercializador')
+const SECURITY_ALERT_EMAIL = process.env.SECURITY_ALERT_EMAIL || ''
 
-function priceIdFor(modulo) {
-  return process.env[`STRIPE_PRICE_${String(modulo).toUpperCase()}`] || ''
-}
+// ---------- Parámetros de seguridad de pagos y dispositivos ----------
+
+// Ventana anti-replay del HMAC de pagos (segundos). Amplia por defecto porque
+// un pago móvil puede confirmarse horas después de generar la intención; un
+// HMAC viejo siempre se rechaza. Acotarla con PAYMENT_HMAC_WINDOW_SECONDS si
+// el flujo de cobro es inmediato.
+const PAYMENT_HMAC_WINDOW_SECONDS = Number(process.env.PAYMENT_HMAC_WINDOW_SECONDS || 86400)
+const PAYMENT_HMAC_CLOCK_SKEW_SECONDS = 60
+// Máximo de intentos de confirmación/verificación de un mismo pago por minuto.
+const PAYMENT_CONFIRM_MAX_PER_MINUTE = Number(process.env.PAYMENT_CONFIRM_MAX_PER_MINUTE || 10)
+
+// Única fuente de verdad del precio mensual de OmniServ.
+const OMNISERV_MENSUAL = 3
+
+// Un pago pendiente más viejo que esto se expira en el job de conciliación.
+const PENDING_PAYMENT_TTL_HOURS = Number(process.env.PENDING_PAYMENT_TTL_HOURS || 24)
+// Enfriamiento entre cambios de device_fingerprint de una misma empresa.
+const DEVICE_CHANGE_COOLDOWN_HOURS = Number(process.env.DEVICE_CHANGE_COOLDOWN_HOURS || 24)
 
 function plusMonths(baseDate, months) {
   const d = new Date(baseDate)
   d.setMonth(d.getMonth() + months)
   return d.toISOString().split('T')[0]
 }
-
-function plusDays(baseDate, days) {
-  const d = new Date(baseDate)
-  d.setDate(d.getDate() + days)
-  return d.toISOString().split('T')[0]
-}
-
-const GRACE_DAYS = Number(process.env.LICENSE_GRACE_DAYS || 14)
 
 let privateKey = null
 try {
@@ -76,14 +90,14 @@ function setCorsHeaders(res, origin) {
     res.setHeader('Vary', 'Origin')
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Admin-Key, X-Api-Key, Stripe-Signature')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Admin-Key, X-Admin-Email, X-Api-Key, X-Device-Fingerprint')
   res.setHeader('Access-Control-Max-Age', '86400')
 }
 
 // ---------- Rate limiting ----------
 
-const RATE_LIMIT_WINDOW_MS = 60_000 // 1 minuto
-const RATE_LIMIT_MAX = 60            // 60 requests por minuto por IP
+const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000) // 1 minuto
+const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 60)                 // 60 requests por minuto por IP
 const rateLimitMap = new Map()
 let rateLimitCleanupTimer = null
 
@@ -112,6 +126,35 @@ function isRateLimited(ip) {
   return entry.count > RATE_LIMIT_MAX
 }
 
+// ---------- Rate limiting por clave (rutas sensibles) ----------
+
+const scopedLimitMap = new Map()
+
+/**
+ * Límite de solicitudes por clave lógica (IP, empresa, usuario…).
+ * Devuelve `{ allowed, retryAfterSec }` para poder responder 429 + Retry-After,
+ * que es lo que la app Android respeta al hacer polling.
+ */
+function rateLimit(clave, { max, windowMs }) {
+  const ahora = Date.now()
+  if (scopedLimitMap.size > 5000) {
+    for (const [k, v] of scopedLimitMap) {
+      if (ahora - v.start > windowMs) scopedLimitMap.delete(k)
+    }
+  }
+  let entry = scopedLimitMap.get(clave)
+  if (!entry || ahora - entry.start > windowMs) {
+    entry = { start: ahora, count: 0 }
+    scopedLimitMap.set(clave, entry)
+  }
+  entry.count++
+  if (entry.count > max) {
+    const retryAfterSec = Math.max(1, Math.ceil((entry.start + windowMs - ahora) / 1000))
+    return { allowed: false, retryAfterSec }
+  }
+  return { allowed: true, retryAfterSec: 0 }
+}
+
 // ---------- utilidades ----------
 
 function readBody(req) {
@@ -128,17 +171,14 @@ function readBody(req) {
   })
 }
 
-function readRawBody(req) {
-  return new Promise((resolve) => {
-    let data = ''
-    req.on('data', (chunk) => (data += chunk))
-    req.on('end', () => resolve(data))
-  })
+function json(res, status, payload, headers = {}) {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', ...headers })
+  res.end(JSON.stringify(payload, null, 2))
 }
 
-function json(res, status, payload) {
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' })
-  res.end(JSON.stringify(payload, null, 2))
+/** Respuesta 429 homogénea: incluye Retry-After para que el cliente espere. */
+function demasiadasSolicitudes(res, retryAfterSec, mensaje = 'Demasiadas solicitudes. Intenta de nuevo en un momento.') {
+  return json(res, 429, { success: false, error: mensaje }, { 'Retry-After': String(retryAfterSec) })
 }
 
 async function requireAdmin(req, res) {
@@ -210,7 +250,9 @@ async function requireUser(req, res) {
   const auth = req.headers['authorization'] || ''
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : ''
   const payload = verifyToken(token)
-  if (!payload?.uid) {
+  // Un token de step-up (`purpose: '2fa'`) NO autentica la sesión: sólo sirve
+  // para autorizar una operación sensible puntual.
+  if (!payload?.uid || payload.purpose) {
     json(res, 401, { success: false, error: 'Token inválido o expirado' })
     return null
   }
@@ -220,6 +262,154 @@ async function requireUser(req, res) {
     return null
   }
   return user
+}
+
+// ---------- 2FA: TOTP (RFC 6238) ----------
+//
+// La primitiva criptográfica (TOTP/HOTP y cifrado en reposo de los secretos)
+// vive en `totp.js`, que se testea contra los vectores de las RFCs sin tocar la
+// base de datos. Aquí queda la configuración y lo que depende de la DB.
+
+const TOTP_STEP_SECONDS = Number(process.env.TOTP_STEP_SECONDS || 30)
+const TOTP_DIGITS = Number(process.env.TOTP_DIGITS || 6)
+// ±1 paso (± 30 s) para tolerar el desfase de reloj del teléfono.
+const TOTP_WINDOW = Number(process.env.TOTP_WINDOW || 1)
+const TOTP_ISSUER = process.env.TOTP_ISSUER || 'OmniMargen'
+const TWOFA_BACKUP_CODE_COUNT = Number(process.env.TWOFA_BACKUP_CODE_COUNT || 10)
+const TWOFA_MAX_ATTEMPTS_PER_MINUTE = Number(process.env.TWOFA_MAX_ATTEMPTS_PER_MINUTE || 5)
+const TWOFA_MAX_FALLOS = Number(process.env.TWOFA_MAX_FALLOS || 5)
+const TWOFA_LOCKOUT_MINUTES = Number(process.env.TWOFA_LOCKOUT_MINUTES || 15)
+const TWOFA_STEPUP_TTL_SECONDS = Number(process.env.TWOFA_STEPUP_TTL_SECONDS || 600)
+const TWOFA_ALERTA_FALLOS_POR_IP = Number(process.env.TWOFA_ALERTA_FALLOS_POR_IP || 10)
+
+const OPCIONES_TOTP = { step: TOTP_STEP_SECONDS, digits: TOTP_DIGITS, window: TOTP_WINDOW }
+
+/**
+ * Material para cifrar los secretos 2FA en reposo. Se prefiere
+ * `TWO_FACTOR_ENC_KEY`; si no está se deriva de `JWT_SECRET` (ya obligatorio),
+ * para no exigir configuración extra.
+ * ⚠️ Rotar el material usado invalida los secretos guardados: los usuarios
+ * tendrían que volver a enrolar 2FA.
+ */
+function material2FA() {
+  return process.env.TWO_FACTOR_ENC_KEY || JWT_SECRET
+}
+
+/** Verifica un código TOTP contra el secreto (cifrado) de un usuario. */
+function verificarCodigoTOTP(secretoCifrado, codigo) {
+  try {
+    return verifyTOTP(descifrar(secretoCifrado, material2FA()), codigo, OPCIONES_TOTP)
+  } catch (err) {
+    // Secreto indescifrable (p. ej. se rotó la clave de cifrado): se rechaza.
+    console.error('[2fa] no se pudo descifrar el secreto:', err?.message || err)
+    return false
+  }
+}
+
+// ---------- estado, logs y límites de 2FA ----------
+
+async function getTwoFactor(userId) {
+  return db.prepare('SELECT * FROM two_factor_auth WHERE user_id = $1 AND method = $2').get(userId, 'totp')
+}
+
+async function estadoDosFactores(userId) {
+  const fila = await getTwoFactor(userId)
+  if (!fila) {
+    return { enabled: false, pending: false, method: null, confirmed_at: null, last_used_at: null, backup_codes_disponibles: 0 }
+  }
+  const codigos = await db
+    .prepare('SELECT COUNT(*) AS n FROM two_factor_backup_codes WHERE user_id = $1 AND used_at IS NULL')
+    .get(userId)
+  return {
+    enabled: Number(fila.verified) === 1,
+    pending: Number(fila.verified) !== 1,
+    method: fila.method,
+    confirmed_at: fila.confirmed_at || null,
+    last_used_at: fila.last_used_at || null,
+    backup_codes_disponibles: Number(codigos?.n || 0),
+  }
+}
+
+async function logTwoFactor({ userId, action, success, ip, userAgent, detalle = null }) {
+  try {
+    await db
+      .prepare('INSERT INTO two_factor_logs (user_id, action, method, success, ip_address, user_agent, detalle) VALUES ($1, $2, $3, $4, $5, $6, $7)')
+      .run(userId, action, 'totp', success ? 1 : 0, ip || null, String(userAgent || '').slice(0, 200) || null, detalle)
+  } catch (err) {
+    console.error('[2fa] no se pudo registrar el log:', err?.message || err)
+  }
+}
+
+function haceMinutos(minutos) {
+  return new Date(Date.now() - minutos * 60_000).toISOString().replace('T', ' ').slice(0, 19)
+}
+
+async function contarFallos2FA(userId, minutos) {
+  const fila = await db
+    .prepare('SELECT COUNT(*) AS n FROM two_factor_logs WHERE user_id = $1 AND success = 0 AND created_at >= $2')
+    .get(userId, haceMinutos(minutos))
+  return Number(fila?.n || 0)
+}
+
+/**
+ * Límite de intentos: N por minuto y bloqueo temporal tras M fallos en la
+ * ventana. Devuelve null si se puede seguir, o { error, retryAfterSec }.
+ */
+async function limiteYBloqueo2FA(userId) {
+  const limite = rateLimit(`2fa:${userId}`, { max: TWOFA_MAX_ATTEMPTS_PER_MINUTE, windowMs: 60_000 })
+  if (!limite.allowed) {
+    return { error: 'Demasiados intentos seguidos. Espera un minuto.', retryAfterSec: limite.retryAfterSec }
+  }
+  const fallos = await contarFallos2FA(userId, TWOFA_LOCKOUT_MINUTES)
+  if (fallos >= TWOFA_MAX_FALLOS) {
+    return {
+      error: `Verificación bloqueada por ${TWOFA_LOCKOUT_MINUTES} minutos tras ${TWOFA_MAX_FALLOS} intentos fallidos.`,
+      retryAfterSec: TWOFA_LOCKOUT_MINUTES * 60,
+    }
+  }
+  return null
+}
+
+/** Alerta (una sola vez por ráfaga) si hay muchos fallos desde la misma IP. */
+async function alertaFallos2FAPorIP(ip) {
+  if (!ip) return
+  const fila = await db
+    .prepare('SELECT COUNT(*) AS n FROM two_factor_logs WHERE success = 0 AND ip_address = $1 AND created_at >= $2')
+    .get(ip, haceMinutos(15))
+  const fallos = Number(fila?.n || 0)
+  if (fallos === TWOFA_ALERTA_FALLOS_POR_IP) {
+    await sendSecurityAlert('Fallos repetidos de verificación 2FA', `ip=${ip} fallos_en_15min=${fallos}`)
+  }
+}
+
+async function consumirBackupCode(userId, codigo) {
+  const hash = Buffer.from(hashBackupCode(codigo, material2FA()), 'utf8')
+  const filas = await db
+    .prepare('SELECT id, code_hash FROM two_factor_backup_codes WHERE user_id = $1 AND used_at IS NULL')
+    .all(userId)
+  const coincidencia = filas.find((f) => {
+    const almacenado = Buffer.from(String(f.code_hash), 'utf8')
+    return almacenado.length === hash.length && crypto.timingSafeEqual(almacenado, hash)
+  })
+  if (!coincidencia) return false
+  await db.prepare(`UPDATE two_factor_backup_codes SET used_at = ${NOW} WHERE id = $1`).run(coincidencia.id)
+  return true
+}
+
+/**
+ * Guardia de operaciones sensibles: si el usuario tiene 2FA activo, exige un
+ * token de step-up válido (header `x-2fa-token`), emitido por `/api/2fa/step-up`.
+ * Devuelve false y responde 401 si falta.
+ */
+async function requiereStepUp(user, req, res) {
+  const fila = await getTwoFactor(user.id)
+  if (!fila || Number(fila.verified) !== 1) return true
+  const payload = verifyToken(String(req.headers['x-2fa-token'] || ''))
+  if (!payload?.uid || payload.uid !== user.id || payload.purpose !== '2fa') {
+    json(res, 401, { success: false, code: 'TWOFA_REQUIRED', error: 'Esta operación requiere verificación 2FA' })
+    return false
+  }
+  return true
 }
 
 // ---------- precios del carrito de compras ----------
@@ -241,18 +431,147 @@ function totalCarrito(periodo, modulos) {
   return base + extras
 }
 
-// ---------- HMAC para pagos ----------
+// ---------- HMAC para pagos (firmado + anti-replay) ----------
+//
+// La firma cubre `paymentId:monto:empresaId:timestamp`. Sin timestamp, un HMAC
+// filtrado servía para siempre; con ventana de tiempo sólo vale durante N
+// segundos y un replay de un HMAC viejo se rechaza.
 
-function signPaymentHmac(paymentId, monto, empresaId) {
-  const data = `${paymentId}:${monto}:${empresaId}`
-  return crypto.createHmac('sha256', PAYMENT_HMAC_SECRET).update(data).digest('hex')
+function signPaymentHmac(paymentId, monto, empresaId, timestamp = Date.now()) {
+  const data = `${paymentId}:${monto}:${empresaId}:${timestamp}`
+  return {
+    hmac: crypto.createHmac('sha256', PAYMENT_HMAC_SECRET).update(data).digest('hex'),
+    timestamp,
+  }
 }
 
-function verifyPaymentHmac(paymentId, monto, empresaId, hmac) {
-  if (!hmac || typeof hmac !== 'string') return false
-  const expected = signPaymentHmac(paymentId, monto, empresaId)
-  if (hmac.length !== expected.length) return false
+function verifyPaymentHmac(
+  paymentId,
+  monto,
+  empresaId,
+  hmac,
+  timestamp,
+  windowSeconds = PAYMENT_HMAC_WINDOW_SECONDS,
+) {
+  if (typeof hmac !== 'string' || !/^[a-f0-9]{64}$/.test(hmac)) return false
+  const ts = Number(timestamp)
+  if (!Number.isFinite(ts) || ts <= 0) return false
+  const ageMs = Date.now() - ts
+  if (ageMs > windowSeconds * 1000) return false // HMAC vencido (anti-replay)
+  if (ageMs < -PAYMENT_HMAC_CLOCK_SKEW_SECONDS * 1000) return false // reloj del cliente adelantado
+  const { hmac: expected } = signPaymentHmac(paymentId, monto, empresaId, ts)
   return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(hmac))
+}
+
+/** URL de retorno firmada que se entrega al proveedor de pago. */
+function urlConfirmacionFirmada(pagoId, monto, empresaId, host) {
+  const { hmac, timestamp } = signPaymentHmac(pagoId, monto, empresaId)
+  const base = host ? `https://${host}` : `http://localhost:${PORT}`
+  const params = new URLSearchParams({ payment_id: String(pagoId), hmac, ts: String(timestamp) })
+  return `${base}/api/payment/confirm?${params.toString()}`
+}
+
+function parseDetalle(detalle) {
+  try {
+    const parsed = JSON.parse(detalle || '{}')
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * Monto que *debería* tener el pago según lo que se compró (recomputado desde
+ * el detalle, nunca desde lo que diga el cliente).
+ * Devuelve null si el detalle no permite recomputarlo → el pago se rechaza.
+ */
+function montoEsperadoDePago(pago) {
+  const detalle = parseDetalle(pago.detalle)
+  if (detalle.producto === 'omniserv') return OMNISERV_MENSUAL
+  if (detalle.producto === 'tog') {
+    const extras = Array.isArray(detalle.modulos)
+      ? [...new Set(detalle.modulos.filter((m) => MODULOS_EXTRA.includes(m)))]
+      : []
+    return totalCarrito(detalle.periodo, extras)
+  }
+  return null
+}
+
+/** Alerta de seguridad: siempre al log; por email si SECURITY_ALERT_EMAIL existe. */
+async function sendSecurityAlert(subject, mensaje) {
+  console.error(`[seguridad] ${subject} — ${mensaje}`)
+  if (!SECURITY_ALERT_EMAIL) return
+  await sendEmail({
+    to: SECURITY_ALERT_EMAIL,
+    subject: `⚠️ Seguridad OmniMargen — ${subject}`,
+    html: `<pre style="font-family:monospace;white-space:pre-wrap">${subject}\n\n${mensaje}</pre>`,
+  }).catch(() => {})
+}
+
+/**
+ * Confirma un pago: factura + licencia + email.
+ * Sólo debe llamarse después de validar firma, monto y estado.
+ */
+async function confirmarPago(pago, { providerRef = null, por = `crixto:${pago.id}` } = {}) {
+  const empresa = await db.prepare('SELECT * FROM empresas WHERE id = $1').get(pago.empresa_id)
+  if (!empresa) throw new Error('Empresa del pago no encontrada')
+
+  const nroFactura = await generarNroFactura()
+  await db.prepare(
+    `UPDATE pagos SET estado = 'confirmed', paid_at = ${NOW}, nro_factura = $1, provider_ref = COALESCE($2, provider_ref) WHERE id = $3`
+  ).run(nroFactura, providerRef, pago.id)
+
+  const detalle = parseDetalle(pago.detalle)
+  // El estado de pago de la empresa sólo lo controla la compra de OmniServ
+  // (es lo que consulta la app Android); una compra de TOG Admin no lo altera.
+  if (detalle.producto === 'omniserv') {
+    await db.prepare(
+      `UPDATE empresas SET payment_status = 'confirmed', payment_confirmed_at = ${NOW} WHERE id = $1`
+    ).run(empresa.id)
+  }
+
+  const modulos = Array.isArray(detalle.modulos) && detalle.modulos.length ? detalle.modulos : ['comercializador']
+  const meses = MESES_POR_PERIODO[detalle.periodo] || 1
+  if (privateKey) {
+    await emitirLicenciaConModulos(empresa, { modulos, por, meses })
+  }
+
+  const pagoConfirmado = await db.prepare('SELECT * FROM pagos WHERE id = $1').get(pago.id)
+  const user = pago.user_id ? await db.prepare('SELECT * FROM users WHERE id = $1').get(pago.user_id) : null
+  sendInvoiceEmail(pagoConfirmado, empresa, user)
+  return { nroFactura, empresa, pago: pagoConfirmado }
+}
+
+/**
+ * Validaciones comunes antes de confirmar un pago.
+ * Devuelve `{ ok: true }`, `{ ok: true, yaConfirmado: true, nroFactura }`
+ * o `{ ok: false, status, error }`.
+ */
+async function validarPagoParaConfirmar(pago, { hmac, ts, windowSeconds, origen }) {
+  if (!verifyPaymentHmac(pago.id, pago.monto, pago.empresa_id, hmac, ts, windowSeconds)) {
+    await sendSecurityAlert(
+      'Firma de pago inválida o vencida',
+      `origen=${origen} pago=${pago.id} empresa=${pago.empresa_id}`,
+    )
+    return { ok: false, status: 403, error: 'Firma de pago inválida o vencida' }
+  }
+
+  const esperado = montoEsperadoDePago(pago)
+  if (esperado == null || Math.abs(Number(pago.monto) - esperado) > 0.005) {
+    await sendSecurityAlert(
+      'Monto de pago inconsistente',
+      `origen=${origen} pago=${pago.id} empresa=${pago.empresa_id} registrado=${pago.monto} esperado=${esperado}`,
+    )
+    return { ok: false, status: 409, error: 'Monto inconsistente con el plan seleccionado' }
+  }
+
+  if (pago.estado === 'confirmed') {
+    return { ok: true, yaConfirmado: true, nroFactura: pago.nro_factura }
+  }
+  if (pago.estado !== 'pending') {
+    return { ok: false, status: 409, error: `Pago en estado '${pago.estado}' — no se puede confirmar` }
+  }
+  return { ok: true, yaConfirmado: false }
 }
 
 // ---------- rutas ----------
@@ -272,10 +591,6 @@ async function modulosDeUltimaLicencia(empresaId) {
   return Array.isArray(modulos) ? modulos : []
 }
 
-function moduloDePriceId(priceId) {
-  return MODULOS_COMPRABLES.find((m) => priceIdFor(m) === priceId) || null
-}
-
 async function emitirLicenciaConModulos(empresa, { modulos, por, meses = 1 }) {
   if (!privateKey) throw new Error('Clave privada no configurada para firmar la licencia')
   const conjunto = new Set([...(await modulosDeUltimaLicencia(empresa.id)), ...modulos])
@@ -293,17 +608,15 @@ async function emitirLicenciaConModulos(empresa, { modulos, por, meses = 1 }) {
   return license
 }
 
-async function emitirLicencia(empresa, { modulo, por, meses = 1 }) {
-  return emitirLicenciaConModulos(empresa, { modulos: [modulo], por, meses })
-}
-
-async function revocarLicencia(empresaId, { por, motivo = 'subscription_cancelled' } = {}) {
-  const licencia = await db.prepare('SELECT id FROM licencias WHERE empresa_id = $1 ORDER BY issued_at DESC LIMIT 1').get(empresaId)
-  if (!licencia) return null
-  await db.prepare(
-    `UPDATE licencias SET revoked_at = ${NOW}, motivo_revocado = $1 WHERE id = $2`
-  ).run(motivo, licencia.id)
-  return licencia.id
+/**
+ * Revoca todas las licencias vigentes de una empresa (devolución, fraude,
+ * cancelación manual…). Devuelve cuántas se revocaron.
+ */
+async function revocarLicencia(empresaId, { motivo = 'revocada:admin' } = {}) {
+  const result = await db.prepare(
+    `UPDATE licencias SET revoked_at = ${NOW}, motivo_revocado = $1 WHERE empresa_id = $2 AND revoked_at IS NULL`
+  ).run(motivo, empresaId)
+  return result.changes
 }
 
 // ---------- facturas / recibos ----------
@@ -439,27 +752,61 @@ ${empresa ? `<p>La licencia de <strong>${empresa.nombre}</strong> vence el <stro
 </body></html>`
 }
 
-async function revocarImpagosVencidos() {
-  const hoy = new Date().toISOString().split('T')[0]
-  const vencidas = await db
-    .prepare("SELECT id, empresa_id FROM suscripciones WHERE estado = 'impago' AND grace_ends_at IS NOT NULL AND grace_ends_at < $1")
-    .all(hoy)
-  if (!vencidas.length) return
-  await db.exec('BEGIN')
-  try {
-    for (const s of vencidas) {
-      await db.prepare(`UPDATE suscripciones SET estado = 'cancelado_impago', updated_at = ${NOW} WHERE id = $1`).run(s.id)
-      await db.prepare(
-        `UPDATE licencias SET revoked_at = ${NOW}, motivo_revocado = 'impago:grace-period' WHERE empresa_id = $1 AND revoked_at IS NULL`
-      ).run(s.empresa_id)
-    }
-    await db.exec('COMMIT')
-  } catch (err) {
-    try {
-      await db.exec('ROLLBACK')
-    } catch {}
-    throw err
-  }
+function html2FAEstado(user, activado) {
+  return `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>${activado ? '2FA activado' : '2FA desactivado'}</title></head>
+<body style="font-family:sans-serif;max-width:560px;margin:40px auto;color:#222">
+<h1 style="color:${activado ? '#16a34a' : '#dc2626'}">${activado ? 'Verificación en dos pasos ACTIVADA' : 'Verificación en dos pasos DESACTIVADA'}</h1>
+<p>Hola <strong>${user.nombre || 'Usuario'}</strong>,</p>
+<p>${activado
+    ? 'Tu cuenta ahora pide un código de tu app de autenticación para las operaciones sensibles (cambio de email, regenerar códigos de respaldo y desactivar 2FA).'
+    : 'Tu cuenta ya NO pide código adicional para las operaciones sensibles.'}</p>
+<p><strong>Si no fuiste tú,</strong> cambiá tu contraseña y escribinos a soporte@omnimargen.site de inmediato.</p>
+<p style="color:#666;margin-top:32px;font-size:13px">OmniMargen — omnimargen.site</p>
+</body></html>`
+}
+
+async function send2FAEstadoEmail(user, activado) {
+  if (!user?.email) return
+  await sendEmail({
+    to: user.email,
+    subject: activado ? 'Verificación en dos pasos activada — OmniMargen' : 'Verificación en dos pasos desactivada — OmniMargen',
+    html: html2FAEstado(user, activado),
+  })
+}
+
+function htmlEmailCambiado(anterior, nuevo) {
+  return `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Tu email cambió</title></head>
+<body style="font-family:sans-serif;max-width:560px;margin:40px auto;color:#222">
+<h1 style="color:#d97706">Tu email de acceso cambió</h1>
+<p>El email de tu cuenta OmniMargen pasó de <strong>${anterior}</strong> a <strong>${nuevo}</strong>.</p>
+<p><strong>Si no fuiste tú,</strong> escribinos ahora a soporte@omnimargen.site: alguien podría tener acceso a tu cuenta.</p>
+<p style="color:#666;margin-top:32px;font-size:13px">OmniMargen — omnimargen.site</p>
+</body></html>`
+}
+
+function htmlDeviceChange(empresa, fingerprintNuevo, razon) {
+  return `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Cambio de dispositivo autorizado</title></head>
+<body style="font-family:sans-serif;max-width:560px;margin:40px auto;color:#222">
+<h1 style="color:#d97706">Se cambió el dispositivo de tu licencia</h1>
+<p>Hola,</p>
+<p>El dispositivo autorizado de <strong>${empresa.nombre}</strong> (${empresa.pais} · ${empresa.documento}) acaba de cambiar.</p>
+<div style="border:1px solid #ddd;border-radius:8px;padding:12px 16px;margin:16px 0">
+  <p style="margin:4px 0"><strong>Fecha:</strong> ${new Date().toLocaleString('es-VE', { timeZone: 'UTC' })} UTC</p>
+  <p style="margin:4px 0"><strong>Dispositivo nuevo:</strong> ${fingerprintNuevo ?? '— (desvinculado) —'}</p>
+  <p style="margin:4px 0"><strong>Motivo declarado:</strong> ${razon}</p>
+</div>
+<p><strong>Si no solicitaste este cambio,</strong> responde a este correo de inmediato: alguien podría estar intentando activar tu licencia en otro equipo.</p>
+<p style="color:#666;margin-top:32px;font-size:13px">OmniMargen — omnimargen.site · soporte@omnimargen.site</p>
+</body></html>`
+}
+
+async function sendDeviceChangeEmail(empresa, fingerprintNuevo, razon) {
+  if (!empresa?.email_contacto) return
+  await sendEmail({
+    to: empresa.email_contacto,
+    subject: 'Se cambió el dispositivo autorizado de tu licencia — OmniMargen',
+    html: htmlDeviceChange(empresa, fingerprintNuevo, razon),
+  })
 }
 
 let lastRenewalReminderDay = ''
@@ -483,37 +830,6 @@ async function enviarRecordatoriosRenovacion() {
       subject: `Tu licencia vence en ${diasRestantes} día${diasRestantes === 1 ? '' : 's'} — OmniMargen`,
       html: htmlRenewalReminder(user || { nombre: lic.email_contacto }, { nombre: lic.nombre, fecha_expiracion: lic.expira }, diasRestantes),
     }).catch(() => {})
-  }
-}
-
-async function procesarCheckout(event) {
-  const session = event?.data?.object || {}
-  const modulo = session?.metadata?.modulo
-  if (!MODULOS_COMPRABLES.includes(modulo)) {
-    throw new Error(`Módulo no comprable en checkout: ${modulo}`)
-  }
-  const empresaId = Number(session?.client_reference_id)
-  const empresa = empresaId
-    ? await db.prepare('SELECT * FROM empresas WHERE id = $1').get(empresaId)
-    : await db.prepare('SELECT * FROM empresas WHERE stripe_customer_id = $1').get(session?.customer)
-  if (!empresa) throw new Error('Empresa no encontrada para el checkout')
-  if (session?.customer) {
-    await db.prepare('UPDATE empresas SET stripe_customer_id = $1 WHERE id = $2').run(session.customer, empresa.id)
-  }
-  try {
-    await emitirLicencia(empresa, { modulo, por: `stripe:${event.id}` })
-  } catch (err) {
-    console.error(`[webhook] emitirLicencia falló para empresa ${empresa.id}, módulo ${modulo}:`, err.message)
-    throw err
-  }
-
-  const subId = session?.subscription ? String(session.subscription) : null
-  if (subId) {
-    await db.prepare(
-      `INSERT INTO suscripciones (empresa_id, stripe_subscription_id, stripe_price_id, estado, failed_at, grace_ends_at)
-       VALUES ($1, $2, $3, 'active', NULL, NULL)
-       ON CONFLICT(stripe_subscription_id) DO UPDATE SET estado = 'active', failed_at = NULL, grace_ends_at = NULL, updated_at = ${NOW}`
-    ).run(empresa.id, subId, priceIdFor(modulo))
   }
 }
 
@@ -585,22 +901,78 @@ async function handle(req, res) {
     return json(res, 200, { empresas: rows })
   }
 
-  // POST /api/admin/empresas/:id/dispositivo (admin)
+  // POST /api/admin/empresas/:id/dispositivo (admin) — cambia el dispositivo
+  // autorizado. Queda auditado (cuándo, por qué, desde qué IP y con qué key) y
+  // se avisa por email al dueño; con enfriamiento de 24h por empresa.
   const dispositivoMatch = path.match(/^\/api\/admin\/empresas\/(\d+)\/dispositivo$/)
   if (method === 'POST' && dispositivoMatch) {
     if (!(await requireAdmin(req, res))) return
     const empresaId = Number(dispositivoMatch[1])
-    if (!(await db.prepare('SELECT id FROM empresas WHERE id = $1').get(empresaId))) {
+    const empresa = await db.prepare('SELECT * FROM empresas WHERE id = $1').get(empresaId)
+    if (!empresa) {
       return json(res, 404, { success: false, error: 'Empresa no encontrada' })
     }
+
     const body = await readBody(req)
     const nuevo = typeof body?.device_fingerprint === 'string' ? body.device_fingerprint.trim() : null
+    const razon = typeof body?.razon === 'string' ? body.razon.trim() : ''
     if (nuevo === '') {
       return json(res, 400, { success: false, error: 'device_fingerprint debe ser un hash no vacío o null (para desvincular)' })
     }
+    if (nuevo !== null && !/^[a-fA-F0-9]{16,128}$/.test(nuevo)) {
+      return json(res, 400, { success: false, error: 'device_fingerprint debe ser un hash hexadecimal de 16 a 128 caracteres' })
+    }
+    if (razon.length < 5 || razon.length > 200) {
+      return json(res, 400, { success: false, error: 'razon es requerida (5–200 caracteres): justifica el cambio' })
+    }
+
+    const limiteFecha = new Date(Date.now() - DEVICE_CHANGE_COOLDOWN_HOURS * 3600_000).toISOString().replace('T', ' ').slice(0, 19)
+    const ultimo = await db
+      .prepare('SELECT id, created_at FROM device_fingerprint_audit WHERE empresa_id = $1 AND created_at >= $2 ORDER BY id DESC LIMIT 1')
+      .get(empresaId, limiteFecha)
+    if (ultimo) {
+      return json(res, 429, {
+        success: false,
+        error: `Ya se cambió el dispositivo de esta empresa hace menos de ${DEVICE_CHANGE_COOLDOWN_HOURS}h. Intenta más tarde o contacta soporte.`,
+        ultimo_cambio: ultimo.created_at,
+      })
+    }
+
     await db.prepare('UPDATE empresas SET device_fingerprint = $1 WHERE id = $2').run(nuevo, empresaId)
+
+    const adminEmail = String(req.headers['x-admin-email'] || '').trim().slice(0, 120)
+    const adminKeyHash = crypto.createHash('sha256').update(String(req.headers['x-admin-key'] || '')).digest('hex').slice(0, 16)
+    await db.prepare(
+      `INSERT INTO device_fingerprint_audit
+         (empresa_id, admin_key_hash, admin_email, fingerprint_antiguo, fingerprint_nuevo, razon, ip_address, user_agent)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
+    ).run(
+      empresaId,
+      adminKeyHash,
+      adminEmail || null,
+      empresa.device_fingerprint,
+      nuevo,
+      razon,
+      ip,
+      String(req.headers['user-agent'] || '').slice(0, 200),
+    )
+
+    console.log(`[admin] device_fingerprint de empresa ${empresaId} cambiado — ${razon}`)
+    sendDeviceChangeEmail(empresa, nuevo, razon).catch(() => {})
+
     const row = await db.prepare('SELECT id, device_fingerprint FROM empresas WHERE id = $1').get(empresaId)
     return json(res, 200, { success: true, empresa_id: row.id, device_fingerprint: row.device_fingerprint })
+  }
+
+  // GET /api/admin/empresas/:id/audit/dispositivo (admin)
+  const auditDispositivoMatch = path.match(/^\/api\/admin\/empresas\/(\d+)\/audit\/dispositivo$/)
+  if (method === 'GET' && auditDispositivoMatch) {
+    if (!(await requireAdmin(req, res))) return
+    const empresaId = Number(auditDispositivoMatch[1])
+    const cambios = await db
+      .prepare('SELECT id, admin_email, admin_key_hash, fingerprint_antiguo, fingerprint_nuevo, razon, ip_address, created_at FROM device_fingerprint_audit WHERE empresa_id = $1 ORDER BY id DESC LIMIT 100')
+      .all(empresaId)
+    return json(res, 200, { success: true, empresa_id: empresaId, cambios })
   }
 
   // POST /api/empresas/register (public)
@@ -662,71 +1034,56 @@ async function handle(req, res) {
     }
   }
 
-  // GET /api/payment/confirm
+  // GET /api/payment/confirm — retorno firmado del proveedor de pago (Crixto).
+  // La URL la generamos nosotros al crear la intención y viaja firmada con
+  // hmac + ts: sin firma válida (o con firma vencida) no se confirma nada.
   if (method === 'GET' && path === '/api/payment/confirm') {
-    const paymentId = url.searchParams.get('payment_id')
-    const empresaId = url.searchParams.get('empresa_id')
-    const extra = [...url.searchParams.entries()].filter(([k]) => k !== 'payment_id' && k !== 'empresa_id')
+    const paymentId = Number(url.searchParams.get('payment_id'))
+    const hmac = url.searchParams.get('hmac') || ''
+    const ts = url.searchParams.get('ts') || ''
+    const extra = [...url.searchParams.entries()].filter(([k]) => !['payment_id', 'hmac', 'ts'].includes(k))
     const providerRef = extra.length ? extra.map(([k, v]) => `${k}=${v}`).join('&') : null
 
     try {
-      if (paymentId) {
-        const pago = await db.prepare('SELECT * FROM pagos WHERE id = $1').get(Number(paymentId))
-        if (!pago) {
-          res.writeHead(302, { Location: 'https://omnimargen.site/pago-cancelado' })
-          res.end()
-          return
-        }
-        const empresa = await db.prepare('SELECT * FROM empresas WHERE id = $1').get(pago.empresa_id)
-        if (!empresa) throw new Error('Empresa del pago no encontrada')
-        if (pago.estado !== 'confirmed') {
-          const nroFactura = await generarNroFactura()
-          await db.prepare(`UPDATE pagos SET estado = 'confirmed', paid_at = ${NOW}, nro_factura = $1, provider_ref = COALESCE($2, provider_ref) WHERE id = $3`)
-            .run(nroFactura, providerRef, pago.id)
-          const detalle = (() => {
-            try {
-              return JSON.parse(pago.detalle || '{}')
-            } catch {
-              return {}
-            }
-          })()
-          const modulos = Array.isArray(detalle.modulos) && detalle.modulos.length ? detalle.modulos : ['comercializador']
-          const meses = MESES_POR_PERIODO[detalle.periodo] || 1
-          if (privateKey) {
-            await emitirLicenciaConModulos(empresa, { modulos, por: `crixto:${pago.id}`, meses })
-          }
-          const pagoConfirmado = await db.prepare('SELECT * FROM pagos WHERE id = $1').get(pago.id)
-          const user = pago.user_id ? await db.prepare('SELECT * FROM users WHERE id = $1').get(pago.user_id) : null
-          sendInvoiceEmail(pagoConfirmado, empresa, user)
-        }
-        res.writeHead(302, { Location: 'https://omnimargen.site/pago-exitoso' })
+      if (!paymentId || !hmac || !ts) {
+        res.writeHead(302, { Location: `${SITE_URL}/pago-cancelado` })
         res.end()
         return
       }
 
-      if (empresaId) {
-        await db.prepare(`UPDATE empresas SET payment_status = 'confirmed', payment_confirmed_at = ${NOW} WHERE id = $1`)
-          .run(Number(empresaId))
-        const empresa = await db.prepare('SELECT * FROM empresas WHERE id = $1').get(Number(empresaId))
-        if (empresa && privateKey) {
-          await emitirLicencia(empresa, { modulo: 'omniserv', por: 'crixto:auto', meses: 1 })
-        }
-        if (empresa) {
-          const result = await db.prepare(
-            `INSERT INTO pagos (user_id, empresa_id, concepto, detalle, monto, moneda, estado, provider, nro_factura, paid_at) VALUES (NULL, $1, 'omniserv:mensual', $2, 3, 'USD', 'confirmed', 'crixto', $3, ${NOW})`
-          ).run(empresa.id, JSON.stringify({ producto: 'omniserv', periodo: 'mensual', modulos: ['omniserv'], desglose: [{ modulo: 'OmniServ — mensual', precio: 3 }] }), await generarNroFactura())
-          const pago = await db.prepare('SELECT * FROM pagos WHERE id = $1').get(result.lastInsertRowid)
-          const user = await db.prepare('SELECT * FROM users WHERE empresa_id = $1').get(empresa.id)
-          sendInvoiceEmail(pago, empresa, user)
-        }
-        res.writeHead(302, { Location: 'https://omnimargen.site/pago-exitoso' })
+      const limite = rateLimit(`confirm:${paymentId}`, {
+        max: PAYMENT_CONFIRM_MAX_PER_MINUTE,
+        windowMs: 60_000,
+      })
+      if (!limite.allowed) {
+        res.writeHead(429, { 'Retry-After': String(limite.retryAfterSec), 'Content-Type': 'text/html; charset=utf-8' })
+        res.end(paginaSimple('Demasiados intentos', 'Espera un momento y vuelve a intentar la confirmación del pago.'))
+        return
+      }
+
+      const pago = await db.prepare('SELECT * FROM pagos WHERE id = $1').get(paymentId)
+      if (!pago) {
+        res.writeHead(302, { Location: `${SITE_URL}/pago-cancelado` })
         res.end()
         return
       }
 
-      res.writeHead(302, { Location: 'https://omnimargen.site/pago-exitoso' })
+      const validacion = await validarPagoParaConfirmar(pago, { hmac, ts, origen: 'redirect' })
+      if (!validacion.ok) {
+        console.error(`[payment/confirm] pago ${paymentId} rechazado: ${validacion.error}`)
+        res.writeHead(302, { Location: `${SITE_URL}/pago-cancelado` })
+        res.end()
+        return
+      }
+
+      if (!validacion.yaConfirmado) {
+        await confirmarPago(pago, { providerRef })
+      }
+
+      res.writeHead(302, { Location: `${SITE_URL}/pago-exitoso` })
       res.end()
     } catch (err) {
+      console.error('[payment/confirm]', err)
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       res.end(paginaSimple('Error', 'Error al procesar el pago. Contacta soporte.'))
     }
@@ -877,6 +1234,260 @@ async function handle(req, res) {
     })
   }
 
+  // GET /api/2fa/status (JWT)
+  if (method === 'GET' && path === '/api/2fa/status') {
+    const user = await requireUser(req, res)
+    if (!user) return
+    return json(res, 200, { success: true, ...(await estadoDosFactores(user.id)) })
+  }
+
+  // POST /api/2fa/setup/totp (JWT) — genera un secreto pendiente (no activa nada)
+  if (method === 'POST' && path === '/api/2fa/setup/totp') {
+    const user = await requireUser(req, res)
+    if (!user) return
+
+    const limite = rateLimit(`2fa-setup:${user.id}`, { max: 5, windowMs: 60_000 })
+    if (!limite.allowed) return demasiadasSolicitudes(res, limite.retryAfterSec)
+
+    const actual = await getTwoFactor(user.id)
+    if (actual && Number(actual.verified) === 1) {
+      return json(res, 409, { success: false, error: '2FA ya está activo. Desactívalo antes de reconfigurarlo.' })
+    }
+
+    const secret = generateTOTPSecret()
+    // Se reemplaza cualquier setup pendiente: todavía no verificaba nada.
+    await db.prepare('DELETE FROM two_factor_auth WHERE user_id = $1').run(user.id)
+    await db
+      .prepare("INSERT INTO two_factor_auth (user_id, method, secret, verified) VALUES ($1, 'totp', $2, 0)")
+      .run(user.id, cifrar(secret, material2FA()))
+    await logTwoFactor({ userId: user.id, action: 'setup', success: 1, ip, userAgent: req.headers['user-agent'] })
+
+    return json(res, 201, {
+      success: true,
+      method: 'totp',
+      secret,
+      digits: TOTP_DIGITS,
+      step: TOTP_STEP_SECONDS,
+      otpauth_uri: otpauthUri({
+        secret,
+        email: user.email,
+        issuer: TOTP_ISSUER,
+        digits: TOTP_DIGITS,
+        step: TOTP_STEP_SECONDS,
+      }),
+      mensaje: 'Carga la clave en tu app de autenticación y confirmá con el código de 6 dígitos.',
+    })
+  }
+
+  // POST /api/2fa/verify/totp (JWT) — activa 2FA y entrega los códigos de respaldo (una sola vez)
+  if (method === 'POST' && path === '/api/2fa/verify/totp') {
+    const user = await requireUser(req, res)
+    if (!user) return
+
+    const bloqueo = await limiteYBloqueo2FA(user.id)
+    if (bloqueo) {
+      return json(res, 429, { success: false, error: bloqueo.error }, { 'Retry-After': String(bloqueo.retryAfterSec) })
+    }
+
+    const fila = await getTwoFactor(user.id)
+    if (!fila) return json(res, 409, { success: false, error: 'No hay un setup de 2FA pendiente' })
+    if (Number(fila.verified) === 1) return json(res, 409, { success: false, error: '2FA ya está activo' })
+
+    const body = await readBody(req)
+    const ok = verificarCodigoTOTP(fila.secret, body?.codigo)
+    await logTwoFactor({ userId: user.id, action: 'enable', success: ok ? 1 : 0, ip, userAgent: req.headers['user-agent'] })
+    if (!ok) {
+      await alertaFallos2FAPorIP(ip)
+      return json(res, 401, { success: false, error: 'Código inválido' })
+    }
+
+    const codigos = generateBackupCodes(TWOFA_BACKUP_CODE_COUNT)
+    await db.exec('BEGIN')
+    try {
+      await db
+        .prepare(`UPDATE two_factor_auth SET verified = 1, confirmed_at = ${NOW}, last_used_at = ${NOW} WHERE user_id = $1`)
+        .run(user.id)
+      await db.prepare('DELETE FROM two_factor_backup_codes WHERE user_id = $1').run(user.id)
+      for (const codigo of codigos) {
+        await db
+          .prepare('INSERT INTO two_factor_backup_codes (user_id, code_hash) VALUES ($1, $2)')
+          .run(user.id, hashBackupCode(codigo, material2FA()))
+      }
+      await db.exec('COMMIT')
+    } catch (err) {
+      try {
+        await db.exec('ROLLBACK')
+      } catch {}
+      throw err
+    }
+
+    send2FAEstadoEmail(user, true).catch(() => {})
+    return json(res, 200, {
+      success: true,
+      backup_codes: codigos,
+      mensaje: '2FA activado. Guarda estos códigos: no se vuelven a mostrar.',
+    })
+  }
+
+  // POST /api/2fa/step-up (JWT) — código TOTP o de respaldo → token de corta vida
+  if (method === 'POST' && path === '/api/2fa/step-up') {
+    const user = await requireUser(req, res)
+    if (!user) return
+
+    const bloqueo = await limiteYBloqueo2FA(user.id)
+    if (bloqueo) {
+      return json(res, 429, { success: false, error: bloqueo.error }, { 'Retry-After': String(bloqueo.retryAfterSec) })
+    }
+
+    const fila = await getTwoFactor(user.id)
+    if (!fila || Number(fila.verified) !== 1) {
+      return json(res, 409, { success: false, error: '2FA no está activo' })
+    }
+
+    const body = await readBody(req)
+    const usarRespaldo = Boolean(body?.backup_code)
+    const ok = usarRespaldo
+      ? await consumirBackupCode(user.id, body.backup_code)
+      : verificarCodigoTOTP(fila.secret, body?.codigo)
+    await logTwoFactor({
+      userId: user.id,
+      action: usarRespaldo ? 'recovery' : 'verify',
+      success: ok ? 1 : 0,
+      ip,
+      userAgent: req.headers['user-agent'],
+    })
+    if (!ok) {
+      await alertaFallos2FAPorIP(ip)
+      return json(res, 401, { success: false, error: usarRespaldo ? 'Código de respaldo inválido o ya usado' : 'Código inválido' })
+    }
+
+    await db.prepare(`UPDATE two_factor_auth SET last_used_at = ${NOW} WHERE user_id = $1`).run(user.id)
+    const estado = await estadoDosFactores(user.id)
+    return json(res, 200, {
+      success: true,
+      twofa_token: signToken({ uid: user.id, purpose: '2fa' }, TWOFA_STEPUP_TTL_SECONDS),
+      expira_en_segundos: TWOFA_STEPUP_TTL_SECONDS,
+      backup_codes_disponibles: estado.backup_codes_disponibles,
+    })
+  }
+
+  // POST /api/2fa/disable (JWT) — exige contraseña + código (TOTP o de respaldo)
+  if (method === 'POST' && path === '/api/2fa/disable') {
+    const user = await requireUser(req, res)
+    if (!user) return
+
+    const bloqueo = await limiteYBloqueo2FA(user.id)
+    if (bloqueo) {
+      return json(res, 429, { success: false, error: bloqueo.error }, { 'Retry-After': String(bloqueo.retryAfterSec) })
+    }
+
+    const fila = await getTwoFactor(user.id)
+    if (!fila || Number(fila.verified) !== 1) {
+      return json(res, 409, { success: false, error: '2FA no está activo' })
+    }
+
+    const body = await readBody(req)
+    if (!verifyPassword(String(body?.password || ''), user.password_hash)) {
+      await logTwoFactor({
+        userId: user.id,
+        action: 'disable',
+        success: 0,
+        ip,
+        userAgent: req.headers['user-agent'],
+        detalle: 'contraseña incorrecta',
+      })
+      return json(res, 401, { success: false, error: 'Contraseña incorrecta' })
+    }
+
+    const ok = body?.backup_code
+      ? await consumirBackupCode(user.id, body.backup_code)
+      : verificarCodigoTOTP(fila.secret, body?.codigo)
+    await logTwoFactor({ userId: user.id, action: 'disable', success: ok ? 1 : 0, ip, userAgent: req.headers['user-agent'] })
+    if (!ok) {
+      await alertaFallos2FAPorIP(ip)
+      return json(res, 401, { success: false, error: 'Código 2FA inválido' })
+    }
+
+    await db.exec('BEGIN')
+    try {
+      await db.prepare('DELETE FROM two_factor_auth WHERE user_id = $1').run(user.id)
+      await db.prepare('DELETE FROM two_factor_backup_codes WHERE user_id = $1').run(user.id)
+      await db.exec('COMMIT')
+    } catch (err) {
+      try {
+        await db.exec('ROLLBACK')
+      } catch {}
+      throw err
+    }
+
+    send2FAEstadoEmail(user, false).catch(() => {})
+    return json(res, 200, { success: true, message: '2FA desactivado' })
+  }
+
+  // POST /api/2fa/backup-codes (JWT) — regenera los códigos (requiere step-up)
+  if (method === 'POST' && path === '/api/2fa/backup-codes') {
+    const user = await requireUser(req, res)
+    if (!user) return
+    if (!(await requiereStepUp(user, req, res))) return
+
+    const fila = await getTwoFactor(user.id)
+    if (!fila || Number(fila.verified) !== 1) {
+      return json(res, 409, { success: false, error: '2FA no está activo' })
+    }
+
+    const codigos = generateBackupCodes(TWOFA_BACKUP_CODE_COUNT)
+    await db.prepare('DELETE FROM two_factor_backup_codes WHERE user_id = $1').run(user.id)
+    for (const codigo of codigos) {
+      await db
+        .prepare('INSERT INTO two_factor_backup_codes (user_id, code_hash) VALUES ($1, $2)')
+        .run(user.id, hashBackupCode(codigo, material2FA()))
+    }
+    await logTwoFactor({ userId: user.id, action: 'backup_codes', success: 1, ip, userAgent: req.headers['user-agent'] })
+    return json(res, 200, {
+      success: true,
+      backup_codes: codigos,
+      mensaje: 'Los códigos anteriores ya no sirven.',
+    })
+  }
+
+  // POST /api/user/change-email (JWT) — operación sensible: con 2FA exige step-up
+  if (method === 'POST' && path === '/api/user/change-email') {
+    const user = await requireUser(req, res)
+    if (!user) return
+    if (!(await requiereStepUp(user, req, res))) return
+
+    const body = await readBody(req)
+    const nuevo = typeof body?.email === 'string' ? body.email.trim().toLowerCase() : ''
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(nuevo)) {
+      return json(res, 400, { success: false, error: 'Email inválido' })
+    }
+    if (nuevo === user.email) {
+      return json(res, 400, { success: false, error: 'Es el mismo email que ya tienes' })
+    }
+    const existente = await db.prepare('SELECT id FROM users WHERE email = $1').get(nuevo)
+    if (existente && Number(existente.id) !== Number(user.id)) {
+      return json(res, 409, { success: false, error: 'Ese email ya está en uso' })
+    }
+
+    await db.prepare(`UPDATE users SET email = $1, updated_at = ${NOW} WHERE id = $2`).run(nuevo, user.id)
+    await logTwoFactor({
+      userId: user.id,
+      action: 'change_email',
+      success: 1,
+      ip,
+      userAgent: req.headers['user-agent'],
+      detalle: `email_anterior=${user.email}`,
+    })
+    // Aviso al email viejo: si no fuiste tú, hay que reaccionar ya.
+    sendEmail({
+      to: user.email,
+      subject: 'Tu email de OmniMargen cambió',
+      html: htmlEmailCambiado(user.email, nuevo),
+    }).catch(() => {})
+
+    return json(res, 200, { success: true, email: nuevo })
+  }
+
   // POST /api/payment/create
   if (method === 'POST' && path === '/api/payment/create') {
     const user = await requireUser(req, res)
@@ -906,8 +1517,7 @@ async function handle(req, res) {
       .run(user.id, empresa.id, `tog:${periodo}`, JSON.stringify({ producto: 'tog', periodo, modulos: ['comercializador', ...modulos], desglose }), monto)
     const pagoId = result.lastInsertRowid
 
-    const hmac = signPaymentHmac(pagoId, monto, empresa.id)
-    const successUrl = `${req.headers.host ? 'https://' + req.headers.host : 'http://localhost:3001'}/api/payment/confirm?payment_id=${pagoId}`
+    const { hmac, timestamp } = signPaymentHmac(pagoId, monto, empresa.id)
     return json(res, 201, {
       success: true,
       payment_id: pagoId,
@@ -916,8 +1526,9 @@ async function handle(req, res) {
       periodo,
       modulos: ['comercializador', ...modulos],
       hmac,
-      success_url: successUrl,
-      cancel_url: 'https://omnimargen.site/pago-cancelado',
+      timestamp,
+      success_url: urlConfirmacionFirmada(pagoId, monto, empresa.id, req.headers.host),
+      cancel_url: `${SITE_URL}/pago-cancelado`,
     })
   }
 
@@ -936,64 +1547,85 @@ async function handle(req, res) {
       .run(user.id, empresa.id, 'omniserv:mensual', JSON.stringify({ producto: 'omniserv', periodo: 'mensual', modulos: ['omniserv'], desglose }), monto)
     const pagoId = result.lastInsertRowid
 
-    const hmac = signPaymentHmac(pagoId, monto, empresa.id)
-    const successUrl = `${req.headers.host ? 'https://' + req.headers.host : 'http://localhost:3001'}/api/payment/confirm?payment_id=${pagoId}`
+    const { hmac, timestamp } = signPaymentHmac(pagoId, monto, empresa.id)
     return json(res, 201, {
       success: true,
       payment_id: pagoId,
       monto,
       moneda: 'USD',
       hmac,
-      success_url: successUrl,
-      cancel_url: 'https://omnimargen.site/pago-cancelado',
+      timestamp,
+      success_url: urlConfirmacionFirmada(pagoId, monto, empresa.id, req.headers.host),
+      cancel_url: `${SITE_URL}/pago-cancelado`,
     })
   }
 
-  // GET /api/payment/verify — verifica HMAC y confirma el pago
+  // POST /api/payment/omniserv-intent (api_key) — intención de pago de OmniServ
+  // para el flujo por dispositivo (sin cuenta web). Devuelve la URL de retorno
+  // firmada: el redirect de Crixto ya no puede confirmar pagos por sí solo.
+  if (method === 'POST' && path === '/api/payment/omniserv-intent') {
+    const empresa = await requireEmpresa(req, res)
+    if (!empresa) return
+
+    const limite = rateLimit(`intent:${empresa.id}`, { max: 10, windowMs: 60_000 })
+    if (!limite.allowed) return demasiadasSolicitudes(res, limite.retryAfterSec)
+
+    const monto = OMNISERV_MENSUAL
+    const result = await db
+      .prepare("INSERT INTO pagos (user_id, empresa_id, concepto, detalle, monto, moneda, estado, provider) VALUES (NULL, $1, 'omniserv:mensual', $2, $3, 'USD', 'pending', 'crixto') RETURNING id")
+      .run(
+        empresa.id,
+        JSON.stringify({
+          producto: 'omniserv',
+          periodo: 'mensual',
+          modulos: ['omniserv'],
+          desglose: [{ modulo: 'OmniServ — mensual', precio: monto }],
+        }),
+        monto,
+      )
+    const pagoId = result.lastInsertRowid
+
+    const { hmac, timestamp } = signPaymentHmac(pagoId, monto, empresa.id)
+    return json(res, 201, {
+      success: true,
+      payment_id: pagoId,
+      monto,
+      moneda: 'USD',
+      hmac,
+      timestamp,
+      success_url: urlConfirmacionFirmada(pagoId, monto, empresa.id, req.headers.host),
+      cancel_url: `${SITE_URL}/pago-cancelado`,
+    })
+  }
+
+  // GET /api/payment/verify — verifica firma + monto esperado y confirma el pago
   if (method === 'GET' && path === '/api/payment/verify') {
     const paymentId = Number(url.searchParams.get('payment_id'))
     const hmac = url.searchParams.get('hmac') || ''
+    const ts = url.searchParams.get('ts') || ''
 
-    if (!paymentId || !hmac) {
-      return json(res, 400, { success: false, error: 'Parámetros payment_id y hmac requeridos' })
+    if (!paymentId || !hmac || !ts) {
+      return json(res, 400, { success: false, error: 'Parámetros payment_id, hmac y ts requeridos' })
     }
+
+    const limite = rateLimit(`verify:${paymentId}`, { max: PAYMENT_CONFIRM_MAX_PER_MINUTE, windowMs: 60_000 })
+    if (!limite.allowed) return demasiadasSolicitudes(res, limite.retryAfterSec)
 
     const pago = await db.prepare('SELECT * FROM pagos WHERE id = $1').get(paymentId)
     if (!pago) {
       return json(res, 404, { success: false, error: 'Pago no encontrado' })
     }
 
-    if (!verifyPaymentHmac(paymentId, pago.monto, pago.empresa_id, hmac)) {
-      return json(res, 403, { success: false, error: 'HMAC inválido — posible manipulación' })
+    const validacion = await validarPagoParaConfirmar(pago, { hmac, ts, origen: 'api' })
+    if (!validacion.ok) {
+      return json(res, validacion.status, { success: false, error: validacion.error })
     }
-
-    if (pago.estado === 'confirmed') {
-      return json(res, 200, { success: true, message: 'Pago ya confirmado', nro_factura: pago.nro_factura })
-    }
-
-    if (pago.estado !== 'pending') {
-      return json(res, 409, { success: false, error: `Pago en estado '${pago.estado}' — no se puede confirmar` })
+    if (validacion.yaConfirmado) {
+      return json(res, 200, { success: true, message: 'Pago ya confirmado', nro_factura: validacion.nroFactura })
     }
 
     try {
-      const empresa = await db.prepare('SELECT * FROM empresas WHERE id = $1').get(pago.empresa_id)
-      if (!empresa) throw new Error('Empresa del pago no encontrada')
-
-      const nroFactura = await generarNroFactura()
-      await db.prepare(`UPDATE pagos SET estado = 'confirmed', paid_at = ${NOW}, nro_factura = $1 WHERE id = $2`)
-        .run(nroFactura, pago.id)
-
-      const detalle = (() => { try { return JSON.parse(pago.detalle || '{}') } catch { return {} } })()
-      const modulos = Array.isArray(detalle.modulos) && detalle.modulos.length ? detalle.modulos : ['comercializador']
-      const meses = MESES_POR_PERIODO[detalle.periodo] || 1
-      if (privateKey) {
-        await emitirLicenciaConModulos(empresa, { modulos, por: `crixto:${pago.id}`, meses })
-      }
-
-      const pagoConfirmado = await db.prepare('SELECT * FROM pagos WHERE id = $1').get(pago.id)
-      const user = pago.user_id ? await db.prepare('SELECT * FROM users WHERE id = $1').get(pago.user_id) : null
-      sendInvoiceEmail(pagoConfirmado, empresa, user)
-
+      const { nroFactura } = await confirmarPago(pago)
       return json(res, 200, { success: true, nro_factura: nroFactura, message: 'Pago confirmado y licencia activada' })
     } catch (err) {
       console.error('[payment/verify]', err)
@@ -1022,6 +1654,11 @@ async function handle(req, res) {
   if (method === 'GET' && paymentStatusMatch) {
     const empresa = await requireEmpresa(req, res)
     if (!empresa) return
+
+    // Límite propio de este endpoint: lo consume el polling de OmniServ.
+    const limite = rateLimit(`payment-status:${empresa.id}`, { max: 10, windowMs: 60_000 })
+    if (!limite.allowed) return demasiadasSolicitudes(res, limite.retryAfterSec)
+
     return json(res, 200, {
       success: true,
       payment_confirmed: empresa.payment_status === 'confirmed'
@@ -1071,11 +1708,6 @@ async function handle(req, res) {
     const empresa = await requireEmpresa(req, res)
     if (!empresa) return
     try {
-      await revocarImpagosVencidos()
-    } catch (err) {
-      console.error('[licencia] error al barrer impagos vencidos', err.message)
-    }
-    try {
       await enviarRecordatoriosRenovacion()
     } catch (err) {
       console.error('[licencia] error al enviar recordatorios de renovación', err.message)
@@ -1110,156 +1742,91 @@ async function handle(req, res) {
 
     const licencia = await getActiveLicense(empresa.id)
     if (!licencia) {
-      const sub = await db.prepare('SELECT estado FROM suscripciones WHERE empresa_id = $1 ORDER BY id DESC LIMIT 1').get(empresa.id)
-      if (sub?.estado === 'cancelado_impago') {
-        return json(res, 402, {
-          success: false,
-          error: 'Suscripción cancelada por falta de pago. Reactívala (Stripe o manual) para volver a sincronizar los módulos.',
-        })
-      }
       return json(res, 404, { success: false, error: 'Sin licencia activa' })
     }
     return json(res, 200, { success: true, licencia: JSON.parse(licencia.payload_json) })
   }
 
-  // POST /api/checkout-session (api_key)
-  if (method === 'POST' && path === '/api/checkout-session') {
-    const empresa = await requireEmpresa(req, res)
-    if (!empresa) return
+  // GET /api/admin/jobs/verify-pending-payments (admin)
+  // Job de conciliación de pagos. Crixto no publica webhook ni API de estado,
+  // así que: (1) expira los pendientes viejos y (2) lista los pagos confirmados
+  // sin referencia del proveedor para revisión manual.
+  if (method === 'GET' && path === '/api/admin/jobs/verify-pending-payments') {
+    if (!(await requireAdmin(req, res))) return
+
+    const horas = Number(url.searchParams.get('horas')) || PENDING_PAYMENT_TTL_HOURS
+    const limiteFecha = new Date(Date.now() - horas * 3600_000).toISOString().replace('T', ' ').slice(0, 19)
+
+    const vencidos = await db
+      .prepare("SELECT id, empresa_id, monto, concepto FROM pagos WHERE estado = 'pending' AND created_at < $1")
+      .all(limiteFecha)
+    for (const p of vencidos) {
+      await db.prepare("UPDATE pagos SET estado = 'expired' WHERE id = $1 AND estado = 'pending'").run(p.id)
+    }
+
+    const sinReferencia = await db
+      .prepare("SELECT id, empresa_id, monto, concepto, paid_at FROM pagos WHERE estado = 'confirmed' AND provider_ref IS NULL ORDER BY id DESC LIMIT 100")
+      .all()
+
+    if (vencidos.length) console.log(`[job] ${vencidos.length} pago(s) pendiente(s) expirados (> ${horas}h)`)
+    return json(res, 200, {
+      success: true,
+      expirados: vencidos.length,
+      confirmados_sin_referencia: sinReferencia,
+      mensaje: 'Verifica en Crixto los pagos listados y confirma manualmente los que sí fueron cobrados.',
+    })
+  }
+
+  // POST /api/admin/pagos/:id/confirmar (admin) — conciliación manual
+  const confirmarManualMatch = path.match(/^\/api\/admin\/pagos\/(\d+)\/confirmar$/)
+  if (method === 'POST' && confirmarManualMatch) {
+    if (!(await requireAdmin(req, res))) return
+    const pagoId = Number(confirmarManualMatch[1])
     const body = await readBody(req)
-    const modulo = body?.modulo
-    if (!MODULOS_COMPRABLES.includes(modulo)) {
-      return json(res, 400, {
-        success: false,
-        error: `Módulo no comprable: ${modulo}. Disponibles: ${MODULOS_COMPRABLES.join(', ')}`,
-      })
+    const motivo = typeof body?.motivo === 'string' ? body.motivo.trim() : ''
+    const referencia = typeof body?.referencia === 'string' ? body.referencia.trim() : null
+    if (motivo.length < 5) {
+      return json(res, 400, { success: false, error: 'motivo es requerido (mínimo 5 caracteres)' })
     }
-    const priceId = priceIdFor(modulo)
-    if (!process.env.STRIPE_SECRET_KEY) {
-      return json(res, 503, { success: false, error: 'Stripe no configurado (STRIPE_SECRET_KEY)' })
+
+    const pago = await db.prepare('SELECT * FROM pagos WHERE id = $1').get(pagoId)
+    if (!pago) return json(res, 404, { success: false, error: 'Pago no encontrado' })
+    if (pago.estado !== 'pending') {
+      return json(res, 409, { success: false, error: `Pago en estado '${pago.estado}' — no se puede confirmar` })
     }
-    if (!priceId) {
-      return json(res, 503, {
-        success: false,
-        error: `No hay precio de Stripe configurado para el módulo ${modulo} (STRIPE_PRICE_${String(modulo).toUpperCase()})`,
-      })
+
+    const esperado = montoEsperadoDePago(pago)
+    if (esperado == null || Math.abs(Number(pago.monto) - esperado) > 0.005) {
+      await sendSecurityAlert(
+        'Monto de pago inconsistente (conciliación manual)',
+        `pago=${pagoId} registrado=${pago.monto} esperado=${esperado}`,
+      )
+      return json(res, 409, { success: false, error: 'Monto inconsistente con el plan seleccionado' })
     }
+
     try {
-      let customerId = empresa.stripe_customer_id
-      if (!customerId) {
-        const customer = await createStripeCustomer({
-          secretKey: process.env.STRIPE_SECRET_KEY,
-          email: empresa.email_contacto,
-          name: empresa.nombre,
-        })
-        customerId = customer.id
-        await db.prepare('UPDATE empresas SET stripe_customer_id = $1 WHERE id = $2').run(customerId, empresa.id)
-      }
-      const session = await createCheckoutSession({
-        secretKey: process.env.STRIPE_SECRET_KEY,
-        priceId,
-        customer: customerId,
-        clientReferenceId: empresa.id,
-        metadata: { modulo },
-        successUrl: `${STRIPE_DOMAIN}/checkout/success?empresa=${empresa.id}&modulo=${encodeURIComponent(modulo)}`,
-        cancelUrl: `${STRIPE_DOMAIN}/checkout/cancel`,
-      })
-      return json(res, 201, { success: true, url: session.url })
+      const { nroFactura } = await confirmarPago(pago, { providerRef: referencia, por: `manual:conciliacion (${motivo})` })
+      console.log(`[admin] pago ${pagoId} confirmado manualmente: ${motivo}`)
+      return json(res, 200, { success: true, nro_factura: nroFactura })
     } catch (err) {
-      return json(res, 502, { success: false, error: 'Error al crear sesión de pago' })
+      console.error('[admin/pagos/confirmar]', err)
+      return json(res, 500, { success: false, error: 'Error al confirmar el pago' })
     }
   }
 
-  // GET /checkout/success|cancel
-  if (method === 'GET' && path.startsWith('/checkout/')) {
-    const exito = path.includes('success')
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-    res.end(
-      exito
-        ? paginaSimple('✅ Pago exitoso', 'Tu módulo quedó activado. Vuelve a TOG Admin y presiona "Sincronizar" en Config → Licencia.')
-        : paginaSimple('Pago cancelado', 'Puedes reintentar el pago cuando quieras. No se te cobró nada.'),
-    )
-    return
-  }
-
-  // POST /api/webhook/stripe
-  if (method === 'POST' && path === '/api/webhook/stripe') {
-    if (!STRIPE_WEBHOOK_SECRET || !process.env.STRIPE_SECRET_KEY) {
-      return json(res, 503, {
-        success: false,
-        error: 'Webhook de Stripe no configurado (STRIPE_WEBHOOK_SECRET/STRIPE_SECRET_KEY)',
-      })
+  // POST /api/admin/empresas/:id/revocar-licencia (admin)
+  const revocarMatch = path.match(/^\/api\/admin\/empresas\/(\d+)\/revocar-licencia$/)
+  if (method === 'POST' && revocarMatch) {
+    if (!(await requireAdmin(req, res))) return
+    const empresaId = Number(revocarMatch[1])
+    const body = await readBody(req)
+    const motivo = typeof body?.motivo === 'string' ? body.motivo.trim() : ''
+    if (motivo.length < 5) {
+      return json(res, 400, { success: false, error: 'motivo es requerido (mínimo 5 caracteres)' })
     }
-    const raw = await readRawBody(req)
-    try {
-      verifyStripeWebhook({ secret: STRIPE_WEBHOOK_SECRET, rawBody: raw, signatureHeader: req.headers['stripe-signature'] })
-    } catch (err) {
-      return json(res, 400, { success: false, error: 'Firma del webhook inválida' })
-    }
-    let event
-    try {
-      event = JSON.parse(raw)
-    } catch {
-      return json(res, 400, { success: false, error: 'Payload del webhook no es JSON válido' })
-    }
-
-    let resultado
-    try {
-      await db.exec('BEGIN')
-      const yaProcesado = await db.prepare('SELECT 1 FROM webhook_events WHERE stripe_event_id = $1').get(event.id)
-      if (yaProcesado) {
-        resultado = { duplicado: true }
-      } else {
-        if (event.type === 'checkout.session.completed') {
-          await procesarCheckout(event)
-        } else if (event.type === 'customer.subscription.deleted') {
-          const sub = event?.data?.object
-          if (sub?.id) {
-            const subRecord = await db.prepare('SELECT empresa_id FROM suscripciones WHERE stripe_subscription_id = $1').get(String(sub.id))
-            await db.prepare("UPDATE suscripciones SET estado = 'cancelado', cancel_at_period_end = TRUE WHERE stripe_subscription_id = $1").run(String(sub.id))
-            if (subRecord?.empresa_id) {
-              await revocarLicencia(subRecord.empresa_id, { por: `stripe:${event.id}`, motivo: 'subscription_cancelled' })
-            }
-          }
-        } else if (event.type === 'invoice.payment_failed') {
-          const invoice = event?.data?.object
-          const subId = invoice?.subscription ? String(invoice.subscription) : null
-          if (subId) {
-            await db.prepare(
-              `UPDATE suscripciones SET estado = 'impago', failed_at = ${NOW}, grace_ends_at = $1, updated_at = ${NOW} WHERE stripe_subscription_id = $2`
-            ).run(plusDays(new Date(), GRACE_DAYS), subId)
-          }
-        } else if (event.type === 'invoice.payment_succeeded') {
-          const invoice = event?.data?.object
-          const subId = invoice?.subscription ? String(invoice.subscription) : null
-          if (subId) {
-            const sub = await db
-              .prepare('SELECT empresa_id, stripe_price_id FROM suscripciones WHERE stripe_subscription_id = $1')
-              .get(subId)
-            if (sub) {
-              await db.prepare(
-                `UPDATE suscripciones SET estado = 'active', failed_at = NULL, grace_ends_at = NULL, cancel_at_period_end = FALSE, updated_at = ${NOW} WHERE stripe_subscription_id = $1`
-              ).run(subId)
-              const empresa = await db.prepare('SELECT * FROM empresas WHERE id = $1').get(sub.empresa_id)
-              const modulo = moduloDePriceId(sub.stripe_price_id)
-              if (empresa && modulo) {
-                await emitirLicencia(empresa, { modulo, por: `stripe:${event.id}` })
-              }
-            }
-          }
-        }
-        await db.prepare('INSERT INTO webhook_events (stripe_event_id, tipo, payload) VALUES ($1, $2, $3)').run(event.id, event.type, JSON.stringify(event))
-        resultado = { duplicado: false }
-      }
-      await db.exec('COMMIT')
-      return json(res, 200, { received: true, ...resultado })
-    } catch (err) {
-      try {
-        await db.exec('ROLLBACK')
-      } catch {}
-      console.error('[webhook] error procesando evento', event?.type, err.message)
-      return json(res, 500, { success: false, error: 'Error al procesar el evento' })
-    }
+    const revocadas = await revocarLicencia(empresaId, { motivo: `admin:${motivo}` })
+    if (!revocadas) return json(res, 404, { success: false, error: 'La empresa no tiene licencias vigentes' })
+    return json(res, 200, { success: true, licencias_revocadas: revocadas })
   }
 
   return json(res, 404, { success: false, error: 'Ruta no encontrada' })

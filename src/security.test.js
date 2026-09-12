@@ -132,10 +132,12 @@ test('HTTP error responses do not expose internal error messages', async () => {
   // Verify specific error messages are generic
   assert.ok(serverContent.includes("'Error al registrar empresa'"), 'Should have generic registration error')
   assert.ok(serverContent.includes("'Error al firmar la licencia'"), 'Should have generic license signing error')
-  assert.ok(serverContent.includes("'Error al crear sesión de pago'"), 'Should have generic payment session error')
-  assert.ok(serverContent.includes("'Firma del webhook inválida'"), 'Should have generic webhook signature error')
-  assert.ok(serverContent.includes("'Error al procesar el evento'"), 'Should have generic event processing error')
+  assert.ok(serverContent.includes("'Error al confirmar el pago'"), 'Should have generic payment confirmation error')
+  assert.ok(serverContent.includes("'Firma de pago inválida o vencida'"), 'Should have generic payment signature error')
   assert.ok(serverContent.includes("'Error interno del servidor'"), 'Should have generic internal server error')
+
+  // El proveedor de pagos es Crixto: no debe quedar ningún rastro de Stripe.
+  assert.ok(!/stripe/i.test(serverContent), 'server.js no debe mencionar Stripe')
 })
 
 // ============================================================

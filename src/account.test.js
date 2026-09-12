@@ -13,6 +13,9 @@ process.env.TOG_PLATFORM_DATA = join(tmpDir, 'data')
 process.env.ADMIN_API_KEY = 'test-admin-key'
 process.env.PAYMENT_HMAC_SECRET = 'test-hmac-secret'
 process.env.JWT_SECRET = 'test-jwt-secret'
+// Los tests hacen muchas peticiones desde 127.0.0.1: subimos el límite global
+// por IP (los límites por ruta se prueban aparte, a propósito).
+process.env.RATE_LIMIT_MAX = '5000'
 
 const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 })
 const keyPath = join(tmpDir, 'private.pem')
@@ -55,6 +58,12 @@ async function get(path, headers = {}) {
 async function getJson(path, headers = {}) {
   const res = await fetch(base + path, { headers })
   return { status: res.status, json: await res.json() }
+}
+
+/** Path + query del redirect firmado que devuelve el backend. */
+function redirectFirmado(data) {
+  const url = new URL(data.success_url)
+  return `${url.pathname}${url.search}`
 }
 
 function verifySignature(licencia) {
@@ -129,7 +138,10 @@ test('payment/create: calcula el monto del carrito según periodo y módulos', a
   assert.equal(base.json.monto, 15)
   assert.equal(base.json.periodo, 'mensual')
   assert.deepEqual(base.json.modulos, ['comercializador'])
-  assert.match(base.json.success_url, /payment_id=\d+/)
+  assert.match(base.json.hmac, /^[a-f0-9]{64}$/)
+  assert.equal(typeof base.json.timestamp, 'number')
+  // La URL que se le da al proveedor va firmada (sin firma no confirma nada)
+  assert.match(base.json.success_url, /payment_id=\d+&hmac=[a-f0-9]{64}&ts=\d+/)
 
   const conExtra = await post('/api/payment/create', { periodo: 'mensual', modulos: ['distribuidor'] }, auth)
   assert.equal(conExtra.status, 201)
@@ -150,12 +162,13 @@ test('payment/create: calcula el monto del carrito según periodo y módulos', a
   assert.equal(moduloInvalido.status, 400)
 })
 
-test('confirm: ?payment_id confirma, emite licencia con los módulos del carrito y genera factura', async () => {
+test('confirm: el redirect firmado confirma, emite licencia con los módulos del carrito y genera factura', async () => {
   const auth = { Authorization: `Bearer ${token}` }
   const creado = await post('/api/payment/create', { periodo: 'mensual', modulos: ['distribuidor'] }, auth)
   const paymentId = creado.json.payment_id
+  const url = redirectFirmado(creado.json)
 
-  const confirm = await get(`/api/payment/confirm?payment_id=${paymentId}`)
+  const confirm = await get(url)
   assert.equal(confirm.status, 302)
   assert.equal(confirm.headers.location, 'https://omnimargen.site/pago-exitoso')
 
@@ -172,7 +185,7 @@ test('confirm: ?payment_id confirma, emite licencia con los módulos del carrito
   assert.match(pagoConfirmado.nro_factura, /^F-\d{4}-\d{4}$/)
 
   // Idempotencia: confirmar de nuevo redirige igualmente
-  const deNuevo = await get(`/api/payment/confirm?payment_id=${paymentId}`)
+  const deNuevo = await get(url)
   assert.equal(deNuevo.status, 302)
 
   const profile2 = await get('/api/user/profile', auth)
@@ -180,39 +193,89 @@ test('confirm: ?payment_id confirma, emite licencia con los módulos del carrito
   assert.equal(confirmados.length, 1, 'seguir con un solo pago confirmado')
 })
 
-test('payment/verify: valida HMAC y confirma el pago, rechaza HMAC inválido', async () => {
+test('payment/verify: firma válida confirma; firma inválida o vencida se rechaza (anti-replay)', async () => {
   const auth = { Authorization: `Bearer ${token}` }
 
   // Crear un nuevo pago pendiente
   const creado = await post('/api/payment/create', { periodo: 'mensual', modulos: ['restaurant'] }, auth)
   assert.equal(creado.status, 201)
-  const { payment_id: pid, monto, hmac, empresa_id } = creado.json
+  const { payment_id: pid, hmac, timestamp } = creado.json
   assert.ok(hmac, 'debe devolver un hmac')
-
-  // HMAC inválido → 403
-  const mala = await getJson(`/api/payment/verify?payment_id=${pid}&hmac=badbadbad`)
-  assert.equal(mala.status, 403)
-  assert.equal(mala.json.success, false)
+  assert.equal(typeof timestamp, 'number', 'debe devolver el timestamp firmado')
 
   // Sin parámetros → 400
   const sinParams = await getJson('/api/payment/verify')
   assert.equal(sinParams.status, 400)
 
+  // Sin ts → 400 (la firma sin timestamp ya no se acepta)
+  const sinTs = await getJson(`/api/payment/verify?payment_id=${pid}&hmac=${hmac}`)
+  assert.equal(sinTs.status, 400)
+
+  // Firma inválida → 403
+  const mala = await getJson(`/api/payment/verify?payment_id=${pid}&hmac=badbadbad&ts=${timestamp}`)
+  assert.equal(mala.status, 403)
+  assert.equal(mala.json.success, false)
+
   // Payment_id inexistente → 404
-  const fantasma = await getJson(`/api/payment/verify?payment_id=999999&hmac=${hmac}`)
+  const fantasma = await getJson(`/api/payment/verify?payment_id=999999&hmac=${hmac}&ts=${timestamp}`)
   assert.equal(fantasma.status, 404)
 
-  // HMAC correcto → confirma el pago
-  const ok = await getJson(`/api/payment/verify?payment_id=${pid}&hmac=${hmac}`)
+  // Firma ajena (otro secreto) → 403
+  const ajena = await getJson(`/api/payment/verify?payment_id=${pid}&hmac=${'a'.repeat(64)}&ts=${timestamp}`)
+  assert.equal(ajena.status, 403)
+
+  // Anti-replay: la misma firma con un timestamp de hace 30 días → 403
+  const vencida = await getJson(
+    `/api/payment/verify?payment_id=${pid}&hmac=${hmac}&ts=${timestamp - 30 * 86_400_000}`,
+  )
+  assert.equal(vencida.status, 403)
+
+  // Reloj adelantado más allá del skew permitido → 403
+  const futuro = await getJson(
+    `/api/payment/verify?payment_id=${pid}&hmac=${hmac}&ts=${timestamp + 10 * 60_000}`,
+  )
+  assert.equal(futuro.status, 403)
+
+  // Firma correcta y fresca → confirma el pago
+  const ok = await getJson(`/api/payment/verify?payment_id=${pid}&hmac=${hmac}&ts=${timestamp}`)
   assert.equal(ok.status, 200)
   assert.equal(ok.json.success, true)
   assert.match(ok.json.nro_factura, /^F-\d{4}-\d{4}$/)
 
   // Idempotencia: confirmar de nuevo → 200 con mensaje
-  const deNuevo = await getJson(`/api/payment/verify?payment_id=${pid}&hmac=${hmac}`)
+  const deNuevo = await getJson(`/api/payment/verify?payment_id=${pid}&hmac=${hmac}&ts=${timestamp}`)
   assert.equal(deNuevo.status, 200)
   assert.equal(deNuevo.json.success, true)
   assert.match(deNuevo.json.message, /ya confirmado/)
+})
+
+test('Fase 25: monto registrado distinto al esperado → 409 aunque la firma sea válida', async () => {
+  const auth = { Authorization: `Bearer ${token}` }
+  const creado = await post('/api/payment/create', { periodo: 'anual', modulos: ['distribuidor'] }, auth)
+  assert.equal(creado.status, 201)
+  const pid = creado.json.payment_id
+
+  const { db } = await import('./db.js')
+  const pago = await db.prepare('SELECT empresa_id FROM pagos WHERE id = $1').get(pid)
+
+  // Firmamos un monto ridículo (el atacante sólo conoce el secreto en tests):
+  // la firma es válida, pero el monto no coincide con el plan comprado.
+  const ts = Date.now()
+  const montoFalso = 1
+  await db.prepare('UPDATE pagos SET monto = $1 WHERE id = $2').run(montoFalso, pid)
+  const hmacFalso = crypto
+    .createHmac('sha256', process.env.PAYMENT_HMAC_SECRET)
+    .update(`${pid}:${montoFalso}:${pago.empresa_id}:${ts}`)
+    .digest('hex')
+
+  const res = await getJson(`/api/payment/verify?payment_id=${pid}&hmac=${hmacFalso}&ts=${ts}`)
+  assert.equal(res.status, 409)
+  assert.match(res.json.error, /[Mm]onto/)
+
+  // El pago sigue pendiente: no se emitió licencia ni factura
+  const fila = await db.prepare('SELECT estado, nro_factura FROM pagos WHERE id = $1').get(pid)
+  assert.equal(fila.estado, 'pending')
+  assert.equal(fila.nro_factura, null)
 })
 
 test('factura: /api/pagos/:id/factura devuelve HTML imprimible con los datos del pago', async () => {
@@ -232,32 +295,137 @@ test('factura: /api/pagos/:id/factura devuelve HTML imprimible con los datos del
   assert.match(factura.text, /\$\d+\.\d{2}/)
 })
 
-test('confirm por empresa_id (OmniServ): mantiene el flujo histórico y registra el pago', async () => {
+test('OmniServ por dispositivo: el redirect sin firma ya no confirma; la intención firmada sí', async () => {
   const adminHeaders = { 'x-admin-key': 'test-admin-key' }
   const empresa = await post('/api/empresas', {
     nombre: 'Kiosco Doña Rosa', pais: 'VE', documento: 'V-11222333', email_contacto: 'rosa@kiosco.com',
   }, adminHeaders)
   const empresaId = empresa.json.id
+  const apiKey = empresa.json.api_key
 
-  const confirm = await get(`/api/payment/confirm?empresa_id=${empresaId}`)
+  // Hueco cerrado: el redirect histórico por empresa_id (sin firma) no confirma
+  const sinFirma = await get(`/api/payment/confirm?empresa_id=${empresaId}`)
+  assert.equal(sinFirma.status, 302)
+  assert.equal(sinFirma.headers.location, 'https://omnimargen.site/pago-cancelado')
+  const trasSinFirma = await get(`/api/empresas/${empresaId}/payment-status`, { 'x-api-key': apiKey })
+  assert.equal(JSON.parse(trasSinFirma.text).payment_confirmed, false, 'sin firma no hay confirmación')
+
+  // Sin api_key → 401
+  const sinApiKey = await post('/api/payment/omniserv-intent', {})
+  assert.equal(sinApiKey.status, 401)
+
+  // Intención de pago firmada
+  const intent = await post('/api/payment/omniserv-intent', {}, { 'x-api-key': apiKey })
+  assert.equal(intent.status, 201)
+  assert.equal(intent.json.monto, 3)
+  assert.match(intent.json.success_url, /payment_id=\d+&hmac=[a-f0-9]{64}&ts=\d+/)
+
+  // El redirect del proveedor usa esa URL firmada
+  const confirm = await get(redirectFirmado(intent.json))
   assert.equal(confirm.status, 302)
   assert.equal(confirm.headers.location, 'https://omnimargen.site/pago-exitoso')
 
-  const status = await get(`/api/empresas/${empresaId}/payment-status`, {
-    'x-api-key': empresa.json.api_key,
-  })
+  const status = await get(`/api/empresas/${empresaId}/payment-status`, { 'x-api-key': apiKey })
   assert.equal(JSON.parse(status.text).payment_confirmed, true)
 
-  const licencia = await get(`/api/empresas/${empresaId}/licencia`, {
-    'x-api-key': empresa.json.api_key,
-  })
+  const licencia = await get(`/api/empresas/${empresaId}/licencia`, { 'x-api-key': apiKey })
   assert.equal(JSON.parse(licencia.text).licencia.modules.includes('omniserv'), true)
 })
 
-test('confirm sin parámetros: redirige a pago-exitoso', async () => {
+test('confirm sin firma: redirige a pago-cancelado (no confirma nada)', async () => {
   const res = await get('/api/payment/confirm')
   assert.equal(res.status, 302)
-  assert.equal(res.headers.location, 'https://omnimargen.site/pago-exitoso')
+  assert.equal(res.headers.location, 'https://omnimargen.site/pago-cancelado')
+})
+
+test('Fase 26: /payment-status tiene su propio límite y responde 429 + Retry-After', async () => {
+  const adminHeaders = { 'x-admin-key': 'test-admin-key' }
+  const empresa = await post('/api/empresas', {
+    nombre: 'Limite Polling C.A.', pais: 'VE', documento: 'J-99999999-9', email_contacto: 'limit@polling.com',
+  }, adminHeaders)
+  const apiKey = empresa.json.api_key
+  const empresaId = empresa.json.id
+
+  let ultima = null
+  for (let i = 0; i < 11; i++) {
+    ultima = await get(`/api/empresas/${empresaId}/payment-status`, { 'x-api-key': apiKey })
+  }
+  assert.equal(ultima.status, 429)
+  assert.ok(Number(ultima.headers['retry-after']) >= 1, 'debe indicar cuántos segundos esperar')
+})
+
+test('Fase 27: job de conciliación expira pendientes viejos y lista confirmados sin referencia', async () => {
+  const adminHeaders = { 'x-admin-key': 'test-admin-key' }
+  const auth = { Authorization: `Bearer ${token}` }
+
+  // Pago pendiente "viejo": lo envejecemos en la DB para el job
+  const creado = await post('/api/payment/create', { periodo: 'mensual', modulos: [] }, auth)
+  const pid = creado.json.payment_id
+  const { db } = await import('./db.js')
+  await db.prepare("UPDATE pagos SET created_at = '2020-01-01 00:00:00' WHERE id = $1").run(pid)
+
+  const job = await get('/api/admin/jobs/verify-pending-payments', adminHeaders)
+  assert.equal(job.status, 200)
+  const resumen = JSON.parse(job.text)
+  assert.equal(resumen.success, true)
+  assert.ok(resumen.expirados >= 1)
+  assert.ok(Array.isArray(resumen.confirmados_sin_referencia))
+  // Los pagos confirmados por redirect no traen referencia del proveedor:
+  // el job los lista para que el admin los verifique en Crixto.
+  assert.ok(
+    resumen.confirmados_sin_referencia.length >= 1,
+    'debe listar los pagos confirmados sin referencia del proveedor',
+  )
+
+  const fila = await db.prepare('SELECT estado FROM pagos WHERE id = $1').get(pid)
+  assert.equal(fila.estado, 'expired')
+
+  // Sólo admin
+  const sinAdmin = await get('/api/admin/jobs/verify-pending-payments')
+  assert.equal(sinAdmin.status, 401)
+
+  // Un pago expirado ya no se puede confirmar
+  const confirm = await getJson(`/api/payment/verify?payment_id=${pid}&hmac=${creado.json.hmac}&ts=${creado.json.timestamp}`)
+  assert.equal(confirm.status, 409)
+})
+
+test('Fase 27: admin puede confirmar a mano un pago conciliado y revocar licencias', async () => {
+  const adminHeaders = { 'x-admin-key': 'test-admin-key' }
+  const auth = { Authorization: `Bearer ${token}` }
+
+  const creado = await post('/api/payment/create', { periodo: 'mensual', modulos: ['productor'] }, auth)
+  const pid = creado.json.payment_id
+
+  // Sin motivo → 400
+  const sinMotivo = await post(`/api/admin/pagos/${pid}/confirmar`, {}, adminHeaders)
+  assert.equal(sinMotivo.status, 400)
+
+  const ok = await post(
+    `/api/admin/pagos/${pid}/confirmar`,
+    { motivo: 'cobro verificado en Crixto 2026-09-12', referencia: 'crixto-abc-123' },
+    adminHeaders,
+  )
+  assert.equal(ok.status, 200)
+  assert.match(ok.json.nro_factura, /^F-\d{4}-\d{4}$/)
+
+  // Confirmar dos veces → 409 (idempotencia por estado)
+  const deNuevo = await post(
+    `/api/admin/pagos/${pid}/confirmar`,
+    { motivo: 'otra vez' },
+    adminHeaders,
+  )
+  assert.equal(deNuevo.status, 409)
+
+  // Revocar licencias de la empresa (queda auditado por motivo)
+  const { db } = await import('./db.js')
+  const pago = await db.prepare('SELECT empresa_id FROM pagos WHERE id = $1').get(pid)
+  const revocar = await post(
+    `/api/admin/empresas/${pago.empresa_id}/revocar-licencia`,
+    { motivo: 'reembolso solicitado por el cliente' },
+    adminHeaders,
+  )
+  assert.equal(revocar.status, 200)
+  assert.ok(revocar.json.licencias_revocadas >= 1)
 })
 
 test('forgot + reset-password: cambia la contraseña con un token válido', async () => {

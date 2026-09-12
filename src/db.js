@@ -9,6 +9,19 @@ let pool = null
 let sqliteDb = null
 const isPostgres = !!process.env.DATABASE_URL
 
+// Tablas del backend. Se usan para verificar RLS en Postgres (Supabase).
+const TABLAS_ECOSISTEMA = [
+  'empresas',
+  'licencias',
+  'users',
+  'password_resets',
+  'pagos',
+  'device_fingerprint_audit',
+  'two_factor_auth',
+  'two_factor_backup_codes',
+  'two_factor_logs',
+]
+
 if (isPostgres) {
   const pg = await import('pg')
   pool = new pg.Pool({
@@ -19,6 +32,29 @@ if (isPostgres) {
     .replace(/INTEGER PRIMARY KEY AUTOINCREMENT/g, 'SERIAL PRIMARY KEY')
     .replace(/datetime\('now'\)/g, 'NOW()')
   await pool.query(schema)
+
+  // Aviso de seguridad: en Supabase el esquema `public` es alcanzable con la
+  // anon key. Si RLS está deshabilitado en nuestras tablas, los datos (incluidos
+  // los secretos 2FA) quedan expuestos a quien tenga esa key pública.
+  try {
+    const { rows } = await pool.query(
+      `SELECT c.relname AS tabla
+         FROM pg_class c
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public'
+          AND c.relkind = 'r'
+          AND c.relname = ANY($1)
+          AND NOT c.relrowsecurity`,
+      [TABLAS_ECOSISTEMA],
+    )
+    if (rows.length > 0) {
+      console.warn(`⚠️  RLS deshabilitado en: ${rows.map((r) => r.tabla).join(', ')}`)
+      console.warn('   Esquema `public` + anon key = datos expuestos. Ejecuta')
+      console.warn('   supabase/migrations/001_rls_policies.sql (ver docs/FACTURACION-CRIXTO.md).')
+    }
+  } catch (err) {
+    console.warn(`⚠️  No se pudo verificar RLS: ${err?.message || err}`)
+  }
 } else {
   const { DatabaseSync } = await import('node:sqlite')
   const { mkdirSync } = await import('node:fs')

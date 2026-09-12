@@ -16,6 +16,9 @@ process.env.TOG_PLATFORM_DATA = join(tmpDir, 'data')
 process.env.ADMIN_API_KEY = 'test-admin-key'
 process.env.PAYMENT_HMAC_SECRET = 'test-hmac-secret'
 process.env.JWT_SECRET = 'test-jwt-secret'
+// Los tests hacen muchas peticiones desde 127.0.0.1: subimos el límite global
+// por IP para que el rate limiting no los vuelva flaky.
+process.env.RATE_LIMIT_MAX = '5000'
 
 const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 })
 const keyPath = join(tmpDir, 'private.pem')
@@ -235,20 +238,14 @@ test('emisión manual acepta los nuevos módulos administracion y rrhh', async (
   assert.equal(verifySignature(licencia), true, 'la firma debe cubrir los nuevos módulos')
 })
 
-test('checkout y webhook devuelven 503 cuando Stripe no está configurado', async () => {
+test('las rutas de Stripe ya no existen (proveedor único: Crixto)', async () => {
   const checkout = await post('/api/checkout-session', { modulo: 'distribuidor' }, {
     'x-api-key': empresa.api_key,
   })
-  assert.equal(checkout.status, 503)
-  assert.match(checkout.json.error, /no configurado/i)
-
-  const moduloInvalido = await post('/api/checkout-session', { modulo: 'base' }, {
-    'x-api-key': empresa.api_key,
-  })
-  assert.equal(moduloInvalido.status, 400)
+  assert.equal(checkout.status, 404)
 
   const webhook = await post('/api/webhook/stripe', { tipo: 'checkout.session.completed' })
-  assert.equal(webhook.status, 503)
+  assert.equal(webhook.status, 404)
 })
 
 test('rutas desconocidas devuelven 404', async () => {
@@ -374,7 +371,7 @@ test('primer dispositivo que reclama la licencia queda vinculado', async () => {
 test('transferencia de dispositivo: admin desvincula y el nuevo teléfono queda vinculado', async () => {
   const desvincular = await post(
     `/api/admin/empresas/${empresaOmniserv.id}/dispositivo`,
-    { device_fingerprint: null },
+    { device_fingerprint: null, razon: 'transferencia de equipo (test)' },
     adminHeaders,
   )
   assert.equal(desvincular.status, 200)
@@ -389,7 +386,54 @@ test('transferencia de dispositivo: admin desvincula y el nuevo teléfono queda 
   assert.equal(viejo.status, 403)
 
   // La transferencia requiere admin
-  const sinAdmin = await post(`/api/admin/empresas/${empresaOmniserv.id}/dispositivo`, { device_fingerprint: null })
+  const sinAdmin = await post(`/api/admin/empresas/${empresaOmniserv.id}/dispositivo`, {
+    device_fingerprint: null,
+    razon: 'sin admin no se puede',
+  })
+  assert.equal(sinAdmin.status, 401)
+})
+
+test('cambio de dispositivo: exige razón válida, queda auditado y aplica enfriamiento 24h', async () => {
+  // Sin razón → 400
+  const sinRazon = await post(
+    `/api/admin/empresas/${empresaOmniserv.id}/dispositivo`,
+    { device_fingerprint: TELEFONO_A },
+    adminHeaders,
+  )
+  assert.equal(sinRazon.status, 400)
+  assert.match(sinRazon.json.error, /razon/i)
+
+  // Hash que no es un hash → 400
+  const hashInvalido = await post(
+    `/api/admin/empresas/${empresaOmniserv.id}/dispositivo`,
+    { device_fingerprint: 'no-es-un-hash!!', razon: 'cliente cambió de teléfono' },
+    adminHeaders,
+  )
+  assert.equal(hashInvalido.status, 400)
+
+  // El test anterior ya cambió el dispositivo: el enfriamiento bloquea el segundo cambio
+  const enFrio = await post(
+    `/api/admin/empresas/${empresaOmniserv.id}/dispositivo`,
+    { device_fingerprint: TELEFONO_A, razon: 'prueba de enfriamiento' },
+    adminHeaders,
+  )
+  assert.equal(enFrio.status, 429)
+
+  // La auditoría registra el cambio con su razón y sin exponer la admin key
+  const audit = await fetch(base + `/api/admin/empresas/${empresaOmniserv.id}/audit/dispositivo`, {
+    headers: adminHeaders,
+  })
+  assert.equal(audit.status, 200)
+  const { cambios } = await audit.json()
+  assert.ok(cambios.length >= 1, 'debe existir al menos un cambio auditado')
+  assert.equal(cambios[0].razon, 'transferencia de equipo (test)')
+  assert.equal(cambios[0].fingerprint_antiguo, TELEFONO_A)
+  assert.equal(cambios[0].fingerprint_nuevo, null)
+  assert.equal(cambios[0].admin_key_hash.length, 16)
+  assert.equal(cambios[0].admin_email, null)
+
+  // Sólo admin
+  const sinAdmin = await fetch(base + `/api/admin/empresas/${empresaOmniserv.id}/audit/dispositivo`)
   assert.equal(sinAdmin.status, 401)
 })
 
