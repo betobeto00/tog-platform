@@ -36,7 +36,7 @@ Toda la documentación vive en [`docs/`](./docs/).
 | [`MODULOS.md`](./docs/MODULOS.md) | Catálogo de módulos (Productor, Procesador, Comercializador, Distribuidor, Postventa, Administración/Contable, RRHH, Restaurant). Ediciones (Starter, Professional, Enterprise, Custom). Modelo de licenciamiento. Pricing de referencia. Roadmap por módulo. |
 | [`INTERCONEXION-RED.md`](./docs/INTERCONEXION-RED.md) | Visión de enlaces PC Base ↔ PC hijas por red local/Intranet: sesión única, tope por licencia, enlace seguro (planificación, no implementado). |
 | [`ARQUITECTURA-MODULAR.md`](./docs/ARQUITECTURA-MODULAR.md) | Diseño técnico del `ModuleManifest`, `ModuleContext`, `ModuleLoader`, EventBus entre módulos. Plan de migración del monolito actual a la arquitectura modular. Dualidad instalador/nube via `IDataSource`. |
-| [`FACTURACION-STRIPE.md`](./docs/FACTURACION-STRIPE.md) | Integración Stripe↔licencia. Backend de licencias (Node + Postgres + Stripe). Webhooks idempotentes. Grace period de 14 días. Modelo offline-first. Seguridad RSA. |
+| [`FACTURACION-CRIXTO.md`](./docs/FACTURACION-CRIXTO.md) | Cobro online con **Crixto**↔licencia: intención de pago firmada, anti-replay HMAC, validación de monto, conciliación de pendientes, rate limiting y auditoría de dispositivo. Modelo offline-first. Seguridad RSA. |
 | [`CONVERSACION-2025-09-01.md`](./docs/CONVERSACION-2025-09-01.md) | Bitácora de la sesión de diseño (limpieza del repo, visión de módulos, modelo de licenciamiento). |
 | [`CONVERSACION-2026-09-02.md`](./docs/CONVERSACION-2026-09-02.md) | Bitácora de la sesión de implementación (módulo Distribuidor, backend verificado, identidad internacional, sync de licencia). |
 
@@ -59,12 +59,12 @@ Una licencia es un JSON firmado RSA:
 }
 ```
 
-**Offline-first.** La licencia siempre es local. La sincronización online (Stripe) aporta renovaciones automáticas y sync entre PCs.
+**Offline-first.** La licencia siempre es local. La sincronización online (pago con Crixto + “Sincronizar”) aporta activación automática y sync entre PCs.
 
 **Mercado internacional.** El mercado no es solo Venezuela: la empresa se identifica por **país (ISO 3166-1 alpha-2) + documento de registro/tributario libre** (RIF, EIN, RFC, NIT, CUIT, CNPJ, VAT…). El mismo número en países distintos son empresas distintas.
 
 **Activación de un módulo nuevo:**
-1. Roberto paga (Stripe o transferencia).
+1. Roberto paga (Crixto o transferencia).
 2. Tu backend actualiza la empresa y firma nueva licencia.
 3. Roberto abre TOG Admin → Config → Licencia → "Sincronizar".
 4. Módulo activo. Sin reinstalar. Sin reiniciar Windows.
@@ -100,16 +100,19 @@ Cuando llegue el momento de la nube, **no hay reescritura**: solo se cambia la i
 | ✅ 1 | Sincronización licencia local ↔ backend (canal pre-auth `license:sync` en Config y bloqueo) |
 | ✅ 5 | Módulo Distribuidor MVP en tog-admin (clientes + pedidos; gating por licencia; flujo Sincronizar validado e2e con `qa-sync`) |
 | ✅ 5 | Interconexión PC Base + PC hijas (spike funcional) — `max_pcs` en `POST /api/empresas/:id/licencias`, migración 031 + módulo `red/` en tog-admin. Pendiente para producción: TLS local + heartbeat 60 s (ver `INTERCONEXION-RED.md`) |
-| ⏸️ 2 | Stripe Checkout + webhooks + grace period de 14 días — **implementados y testeados, en espera** hasta que un cliente quiera pagar online |
-| 🟡 3 | Customer Portal + panel admin web mínimo |
+| ✅ 3 | Carrito web + pago con Crixto → licencia automática (con firma anti-replay, validación de monto y conciliación de pagos dudosos) |
+| 🟡 4 | Panel admin web mínimo (existe API, no UI) + 2FA por TOTP |
 
-## Qué es HOY (flujo manual) y qué está EN ESPERA
+## Qué es HOY y qué está pendiente
 
 > Decisión de alcance (anti-overengineering): no construir infraestructura
-> especulativa. El código de Stripe/nube queda commiteado y testeado, pero **en
-> pausa** hasta que exista un cliente que quiera pagar online.
+> especulativa. Hoy los 3 caminos de licencia funcionan; el panel admin web y el
+> 2FA están pendientes (ver `../ROADMAP_SEGURIDAD.md`, Parte C).
+>
+> **Stripe no se usa y no debe mencionarse**: fue descartado. El proveedor de
+> pago es Crixto.
 
-**Hoy — operar con un cliente (sin servidor público, sin Stripe, sin HTTPS):**
+**Camino manual — operar con un cliente (sin servidor público):**
 
 1. El cliente te contacta (WhatsApp/email) y paga por transferencia o pago móvil.
 2. Tú das de alta su empresa: `POST /api/empresas` (`{ nombre, pais, documento, email_contacto }`).
@@ -117,11 +120,12 @@ Cuando llegue el momento de la nube, **no hay reescritura**: solo se cambia la i
 4. El cliente abre TOG Admin → **Config → Licencia → Sincronizar** (URL + ID de empresa + API Key), o importa el archivo `.key`.
 5. Verificación: `npx tsx scripts/qa-sync.ts` (tog-admin) y checklist en `docs/QA-SYNC.md`.
 
-**En espera — hasta que alguien quiera pagar con tarjeta online:**
+**Camino online — carrito de la landing (operativo):**
 
-- Stripe Checkout + webhooks + grace period (implementado y testeado en `src/`).
-- Requiere decisión de modelo de cobro (suscripción mensual vs. pago único), despliegue del backend con HTTPS y productos/precios reales en Stripe.
-- Harness de prueba real: `npm run smoke:stripe` (solo con claves de modo test).
+- La landing pide `POST /api/payment/create`, recibe la firma HMAC y redirige a Crixto.
+- Al volver, `/api/payment/confirm` o `/api/payment/verify` confirman el pago y emiten la licencia firmada.
+- Emails de factura con Resend; numeración `F-YYYY-NNNN`.
+- Detalle y reglas de seguridad: [`docs/FACTURACION-CRIXTO.md`](./docs/FACTURACION-CRIXTO.md).
 
 ## Backend de licencias (implementación en este repo)
 
@@ -131,10 +135,13 @@ El repo ya **no es solo documentación**: también contiene el backend MVP (Node
 npm start          # servidor en http://localhost:3001 (requiere la clave privada: LICENSE_PRIVATE_KEY_PATH)
 npm test           # suite de integración (node:test)
 npm run test:sign  # autotest de firma RSA
-npm run smoke:stripe  # pago real en modo test de Stripe (requiere sk_test_/whsec_ + tarjeta 4242)
 ```
 
-Variables de entorno (ver [`.env.example`](./.env.example)): `PORT`, `ADMIN_API_KEY`, `LICENSE_PRIVATE_KEY_PATH`, `TOG_PLATFORM_DATA`.
+Variables de entorno (ver [`.env.example`](./.env.example)): obligatorias
+`ADMIN_API_KEY`, `JWT_SECRET`, `PAYMENT_HMAC_SECRET`; opcionales `PORT`,
+`LICENSE_PRIVATE_KEY_PATH`, `TOG_PLATFORM_DATA`, `RATE_LIMIT_MAX`,
+`RATE_LIMIT_WINDOW_MS`, `RESEND_API_KEY`, `INVOICE_FROM`,
+`SECURITY_ALERT_EMAIL`, `SITE_URL`, `PAYMENT_HMAC_WINDOW_SECONDS`, etc.
 
 **Endpoints:**
 
@@ -145,8 +152,16 @@ Variables de entorno (ver [`.env.example`](./.env.example)): `PORT`, `ADMIN_API_
 | `GET` | `/api/admin/empresas` | `X-Admin-Key` | Listado de empresas |
 | `POST` | `/api/empresas/:id/licencias` | `X-Admin-Key` | Emisión manual de licencia firmada `{ cliente, expira, modules?, max_pcs? }`. `max_pcs` 1–20 (default 1) habilita el módulo Red Local en tog-admin |
 | `GET` | `/api/empresas/:id/licencia` | `X-Api-Key` | Licencia activa para el botón “Sincronizar” de la app |
-| `POST` | `/api/checkout-session` | `X-Api-Key` | Suscripción de un módulo vía Stripe Checkout (`{ modulo }`). Requiere `STRIPE_SECRET_KEY` + `STRIPE_PRICE_<MODULO>` |
-| `POST` | `/api/webhook/stripe` | firma | Eventos idempotentes: activa la licencia al pagar (`checkout.session.completed`) |
+| `POST` | `/api/payment/omniserv-intent` | `X-Api-Key` | Intención de pago de OmniServ → URL de retorno firmada (hmac + ts) |
+| `POST` | `/api/payment/create` | JWT | Carrito de TOG Admin: calcula el monto y devuelve la firma del pago |
+| `GET` | `/api/payment/confirm` | firma HMAC+ts | Retorno del proveedor: confirma, factura y emite licencia |
+| `GET` | `/api/payment/verify` | firma HMAC+ts | Verificación desde la landing (idempotente) |
+| `GET` | `/api/empresas/:id/payment-status` | `X-Api-Key` | Estado del pago (polling de OmniServ) |
+| `POST` | `/api/admin/empresas/:id/dispositivo` | `X-Admin-Key` | Cambia el dispositivo autorizado (razón obligatoria + auditoría) |
+| `GET` | `/api/admin/empresas/:id/audit/dispositivo` | `X-Admin-Key` | Historial de cambios de dispositivo |
+| `GET` | `/api/admin/jobs/verify-pending-payments` | `X-Admin-Key` | Expira pendientes viejos y lista pagos sin referencia del proveedor |
+| `POST` | `/api/admin/pagos/:id/confirmar` | `X-Admin-Key` | Confirmación manual de un pago conciliado |
+| `POST` | `/api/admin/empresas/:id/revocar-licencia` | `X-Admin-Key` | Revoca las licencias vigentes (`{ motivo }`) |
 
 Ver detalle completo en [`docs/MODULOS.md`](./docs/MODULOS.md#7-roadmap-por-m%C3%B3dulo).
 

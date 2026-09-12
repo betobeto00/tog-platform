@@ -46,4 +46,4 @@ de la cadena cubrir y lo cambia sin reinstalar ni migrar.
   es el **módulo Comercializador**, que sirve a cualquier negocio de mostrador.
 - No es una colección de apps separadas: es un solo producto configurable.
 - No es infraestructura especulativa: cada módulo se construye cuando hay un
-  cliente que lo necesita (ver `MODULOS.md` y `FACTURACION-STRIPE.md`).
+  cliente que lo necesita (ver `MODULOS.md` y `FACTURACION-CRIXTO.md`).

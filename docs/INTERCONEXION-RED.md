@@ -4,7 +4,7 @@
 > dirección de la interconexión entre PCs del mismo cliente (misma empresa y
 > licencia) para desarrollarla cuando corresponda. Se prioriza **simplicidad y
 > seguridad mínima suficiente**, sin sobreingeniería (misma política que
-> `FACTURACION-STRIPE.md`).
+> `FACTURACION-CRIXTO.md`).
 
 ---
 
@@ -116,8 +116,7 @@ Pensada para活在 en SQLite de la Base cuando se implemente:
 - `MODULOS.md` — catálogo de módulos y ediciones; el rol admin/manager asigna
   módulos y accesos a los usuarios.
 - `ARQUITECTURA-MODULAR.md` — arquitectura de módulos; el login por módulo.
-- `FACTURACION-STRIPE.md` — política anti-sobreingeniería (en espera hasta
-  cliente que lo pida).
+- `FACTURACION-CRIXTO.md` — cobro online con Crixto y política anti-sobreingeniería.
 
 ## Estado — spike funcional implementado (2026-09-05)
 

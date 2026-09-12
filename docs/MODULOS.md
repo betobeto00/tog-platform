@@ -82,7 +82,7 @@ Las ediciones son **bundles comerciales**. Internamente, la licencia sigue siend
 1. **Offline**: tú emites la clave firmada (endpoint `POST /api/empresas/:id/licencias` de este backend, o `scripts/generate-license.js` en tog-admin) y la envías por WhatsApp/correo; Roberto la importa desde la pantalla de bloqueo o desde Configuración.
 2. **Online (Sincronizar)**: Roberto abre TOG Admin → Config → Licencia → **Sincronizar** (URL + ID de empresa + API Key) y la app descarga la licencia activa. Probado de punta a punta (ver `README.md` y `tog-admin/docs/QA-SYNC.md`).
 
-**En espera (online automático con pago)**: Roberto paga con tarjeta vía Stripe Checkout; el webhook reactiva/renueva la licencia automáticamente. Código implementado y testeado en este repo (`src/stripe.js`, webhooks, grace period), **pausado** hasta que un cliente quiera pagar online. Detalle en `FACTURACION-STRIPE.md`.
+**Online automático (operativo)**: el cliente paga con **Crixto** (pago móvil, transferencia o Zelle) desde el carrito de la landing; el backend confirma el pago con firma HMAC anti-replay, valida el monto, factura y emite la licencia firmada. Detalle en `FACTURACION-CRIXTO.md`.
 
 ### 3.4 Offline-first, online-cuando-puede
 
@@ -106,7 +106,7 @@ La licencia define el número de PCs conectadas: **1 PC/1 caja** (solo la Base, 
 Implementación backend de licencias (tog-platform):
 
 - `POST /api/empresas/:id/licencias` acepta `max_pcs` (1–20) en el body y lo incluye firmado en la licencia. Validación en `signLicense` (`src/sign.js`): enteros en rango 1–20; un valor fuera de rango → 400.
-- Licencia emitida por Stripe (`emitirLicencia` en `src/server.js`) **no** setea `max_pcs` explícitamente (queda implícito = 1, solo la Base). Si en el futuro un plan de Stripe requiere multi-PC, se debe pasar `max_pcs` por ahí también.
+- Las licencias emitidas por pago online (`emitirLicenciaConModulos` en `src/server.js`) **no** setean `max_pcs` explícitamente (queda implícito = 1, solo la Base). Si un plan online necesita multi-PC, hay que pasar `max_pcs` también por ese camino.
 - `src/server.test.js` cubre el caso (rango válido + fuera de rango).
 
 Implementación en tog-admin (migración 031): `pcs_enlazadas`, `sesiones_activas`, `codigos_enlace`. Servicios `red-{config,server,client,session}.ts`. Módulo `red/handlers.ts`. `SetupPage` para PC Hija. UI en Config → Sistema → Red Local.
@@ -120,7 +120,7 @@ Implementación en tog-admin (migración 031): `pcs_enlazadas`, `sesiones_activa
 Sin reinstalar. Sin descargar otro `.exe`. Sin técnico en sitio.
 
 ```
-1. Roberto paga (Stripe Checkout o transferencia manual)
+1. Roberto paga (Crixto o transferencia manual)
          ↓
 2. Tu backend actualiza su registro de empresa y firma nueva licencia
          ↓
@@ -204,13 +204,14 @@ Estos números son una **referencia para el roadmap**, no la tabla de precios fi
 - [x] Config → Licencia muestra el catálogo y estado de módulos.
 - [x] Backend (este repo, SQLite) con CRUD de empresas (`pais` + `documento`) y emisión de licencias firmadas.
 
-### Corto plazo (mes 2–6): Distribuidor + Stripe
+### Corto plazo (mes 2–6): Distribuidor + pago online con Crixto
 - [x] Módulo Distribuidor: tablas `clientes`, `pedidos`, `pedido_detalles`, `remitos`, `listas_precio` (migraciones 015/016).
 - [x] CRUD de clientes y pedidos (numeración secuencial, estados) con tests.
 - [x] Venta a crédito/fiado en Comercializador: método de pago `fiado` en el POS + página **Créditos** con saldos y abonos (migraciones 020–022 en `tog-admin`; validación de `limite_credito` del cliente cuando la licencia incluye Distribuidor).
 - [ ] Remitos y listas de precio con UI; rutas/flotas/despachos.
-- [x] Integración Stripe Checkout + webhooks + grace period — ⏸️ **EN ESPERA** de cliente que pague online.
-- [ ] Renovación automática online (idem, EN ESPERA).
+- [x] Cobro online con Crixto → licencia automática (firma anti-replay + validación de monto).
+- [x] Conciliación de pagos pendientes + confirmación manual del admin.
+- [ ] Renovación recurrente automática (Crixto no expone cobro recurrente; hoy se renueva por vencimiento).
 
 ### Medio plazo (mes 6–12): Productor + Procesador
 - [ ] Módulo Productor: siembras, cosechas, costos de campo.
@@ -241,6 +242,5 @@ Estos números son una **referencia para el roadmap**, no la tabla de precios fi
 ## 9. Documentos relacionados
 
 - `ARQUITECTURA-MODULAR.md` — cómo se monta el `ModuleLoader`, el contrato Core↔módulos, el sistema de permisos por módulo.
-- `FACTURACION-STRIPE.md` — sincronización licencia↔pago, webhooks, modelo offline-first.
-- `auto-license-stripe.md` — borrador original del flujo Stripe (referencia).
+- `FACTURACION-CRIXTO.md` — cobro online con Crixto, seguridad de pagos y conciliación.
 - `INFORME-ERP.md` — auditoría arquitectónica del estado actual de TOG Admin.

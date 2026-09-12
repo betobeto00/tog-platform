@@ -26,13 +26,12 @@ TOG Admin (offline-first). **No** contiene UI ni app desktop.
 
 ```
 src/
-├── server.js     # HTTP server (rutas) — entry point (npm start / dev)
-├── db.js         # Capa SQLite (empresas, licencias, suscripciones)
+├── server.js     # HTTP server (rutas + pagos) — entry point (npm start / dev)
+├── db.js         # Capa SQLite/Postgres (empresas, licencias, pagos, users)
 ├── schema.sql    # Esquema de la DB
 ├── sign.js       # Firma/verificación RSA de licencias
-├── stripe.js     # Checkout + webhooks (EN ESPERA de uso productivo)
-└── *.test.js     # Suites node:test (server, stripe, sign)
-docs/             # MODULOS.md, ARQUITECTURA-MODULAR.md, FACTURACION-STRIPE.md, bitácoras
+└── *.test.js     # Suites node:test (server, account, security)
+docs/             # MODULOS.md, ARQUITECTURA-MODULAR.md, FACTURACION-CRIXTO.md, bitácoras
 ```
 
 ## Comandos
@@ -43,13 +42,19 @@ docs/             # MODULOS.md, ARQUITECTURA-MODULAR.md, FACTURACION-STRIPE.md, 
 | `npm run dev` | `node --watch src/server.js` |
 | `npm test` | Suite de integración (`node --test src/*.test.js`) — correr antes de entregar |
 | `npm run test:sign` | Autotest de firma RSA |
-| `npm run smoke:stripe` | Pago real en modo test de Stripe (tarjeta 4242) |
 
 ## Env vars
 
-`PORT`, `ADMIN_API_KEY`, `LICENSE_PRIVATE_KEY_PATH`, `TOG_PLATFORM_DATA`
-(+ `STRIPE_SECRET_KEY`, `STRIPE_PRICE_<MODULO>`, `STRIPE_WEBHOOK_SECRET` solo
-para Stripe). Ver `.env.example`.
+Obligatorias: `ADMIN_API_KEY`, `JWT_SECRET`, `PAYMENT_HMAC_SECRET`.
+Opcionales: `PORT`, `LICENSE_PRIVATE_KEY_PATH`, `TOG_PLATFORM_DATA`,
+`RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW_MS`, `RESEND_API_KEY`, `INVOICE_FROM`,
+`SECURITY_ALERT_EMAIL`, `SITE_URL`, `PAYMENT_HMAC_WINDOW_SECONDS`,
+`PAYMENT_CONFIRM_MAX_PER_MINUTE`, `PENDING_PAYMENT_TTL_HOURS`,
+`DEVICE_CHANGE_COOLDOWN_HOURS`. Ver `.env.example` y
+`docs/FACTURACION-CRIXTO.md`.
+
+**No hay Stripe.** El único proveedor de pago es Crixto; si algo vuelve a
+mencionar Stripe (código, env, docs) es un error: bórralo.
 
 ## Endpoints
 
@@ -60,19 +65,28 @@ para Stripe). Ver `.env.example`.
 | GET | `/api/admin/empresas` | `X-Admin-Key` | Listado de empresas |
 | POST | `/api/empresas/:id/licencias` | `X-Admin-Key` | Emite licencia firmada `{cliente, expira, modules?, max_pcs?}`. `max_pcs` 1–20 habilita el módulo Red Local en tog-admin |
 | GET | `/api/empresas/:id/licencia` | `X-Api-Key` | Licencia activa (botón "Sincronizar" de TOG Admin) |
-| POST | `/api/checkout-session` | `X-Api-Key` | Stripe Checkout de módulo |
-| POST | `/api/webhook/stripe` | firma | Webhook idempotente |
+| POST | `/api/payment/omniserv-intent` | `X-Api-Key` | Intención de pago OmniServ → URL de retorno firmada |
+| GET | `/api/empresas/:id/payment-status` | `X-Api-Key` | Estado del pago (polling de OmniServ, 10 req/min) |
+| GET | `/api/payment/confirm` | firma HMAC+ts | Retorno del proveedor: confirma y emite licencia |
+| GET | `/api/payment/verify` | firma HMAC+ts | Verificación desde la landing (idempotente) |
+| GET | `/api/admin/jobs/verify-pending-payments` | `X-Admin-Key` | Expira pendientes viejos y lista conciliaciones |
+| POST | `/api/admin/pagos/:id/confirmar` | `X-Admin-Key` | Confirmación manual tras verificar el cobro |
+| POST | `/api/admin/empresas/:id/revocar-licencia` | `X-Admin-Key` | Revoca las licencias vigentes |
+| POST | `/api/admin/empresas/:id/dispositivo` | `X-Admin-Key` | Cambia el dispositivo autorizado (razón + auditoría) |
+| GET | `/api/admin/empresas/:id/audit/dispositivo` | `X-Admin-Key` | Historial de cambios de dispositivo |
 
 ## Estado del proyecto (importante)
 
-- **HOY (operativo):** flujo manual — alta de empresa + emisión + “Sincronizar”
-  en la app. Es lo único que se mantiene operando.
-- **EN ESPERA:** Stripe Checkout + webhooks + grace period están implementados y
-  testeado en `src/`, pero NO se expanden ni se priorizan hasta que exista un
-  cliente que quiera pagar online. No construyas infraestructura especulativa.
+- **HOY (operativo):** los 3 caminos de licencia — manual (script), panel admin
+  y pago online con Crixto → licencia automática.
+- **Seguridad de pagos:** firma HMAC con anti-replay, validación de monto
+  esperado, rate limiting, auditoría de cambios de dispositivo y conciliación
+  manual de pagos dudosos. Ver `docs/FACTURACION-CRIXTO.md`.
+- **En pausa:** 2FA y panel admin web (Parte C del roadmap). No construyas
+  infraestructura especulativa.
 
 ## Fuentes
 
 `README.md` (flujo + endpoints) · `docs/MODULOS.md` (catálogo de módulos) ·
-`docs/ARQUITECTURA-MODULAR.md` · `docs/FACTURACION-STRIPE.md` ·
-`docs/CONVERSACION-*.md` (bitácoras de diseño).
+`docs/ARQUITECTURA-MODULAR.md` · `docs/FACTURACION-CRIXTO.md` (pagos) ·
+`docs/CONVERSACION-*.md` (bitácoras de diseño, históricas).

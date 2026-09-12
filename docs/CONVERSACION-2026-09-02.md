@@ -1,5 +1,10 @@
 # Bitácora de Conversación — 2026-09-02
 
+> ⚠️ **BITÁCORA HISTÓRICA.** Describe el bloque de **Stripe** que después se
+> **descartó y eliminó** (código, tests y docs). Hoy el cobro online se hace con
+> **Crixto** (`FACTURACION-CRIXTO.md`). Leé el resto como registro de esa sesión,
+> no como estado actual.
+
 > Continuación de [`CONVERSACION-2025-09-01.md`](./CONVERSACION-2025-09-01.md). Resumen de la sesión: cierre del módulo Distribuidor en TOG Admin, verificación del backend de licencias, internacionalización de la identidad de empresa y sincronización de licencia desde la app.
 
 ---

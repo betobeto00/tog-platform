@@ -357,7 +357,7 @@ Para el caso nube:
 |----------|--------|---------|
 | Un solo `.exe` con todos los módulos | ✅ Diseñado | Activación por licencia, no por instalador |
 | Activación por licencia firmada | ✅ Diseñado | RSA + JSON, offline-first |
-| Sync online con backend propio | 🟡 Diseño | Vercel + Postgres + Stripe (ver FACTURACION-STRIPE) |
+| Sync online con backend propio | ✅ Implementado | Backend Node + SQLite/Postgres en Railway (ver FACTURACION-CRIXTO) |
 | Módulos como paquetes dentro del repo | 🟡 Diseño | Extraer a npm propio solo cuando haya 3º party |
 | Tablas comunes siempre creadas | 🟡 Decidido (v1) | Migrar a "tablas del módulo" si crece |
 | Comunicación entre módulos vía eventos | 🟡 Diseñado | Event bus en `ModuleContext` |
@@ -370,6 +370,5 @@ Para el caso nube:
 
 - `MODULOS.md` — visión de producto, catálogo, pricing, roadmap por módulo.
 - `INTERCONEXION-RED.md` — visión de enlaces PC Base ↔ PC hijas por red local (planificado).
-- `FACTURACION-STRIPE.md` — sincronización licencia↔pago.
+- `FACTURACION-CRIXTO.md` — cobro online (Crixto) y sincronización licencia↔pago.
 - `INFORME-ERP.md` — auditoría técnica del estado actual.
-- `auto-license-stripe.md` — borrador original del flujo Stripe.
