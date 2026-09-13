@@ -12,6 +12,7 @@ import {
   otpauthUri,
   verifyTOTP,
 } from './totp.js'
+import { wrapEmail, escapeHtml } from './email-template.js'
 
 const PORT = Number(process.env.PORT || 3001)
 const PRIVATE_KEY_PATH = process.env.LICENSE_PRIVATE_KEY_PATH || './keys/private.key'
@@ -653,7 +654,7 @@ function htmlFactura(pago, empresa, user) {
     th{background:#f5f7fa}
     .total td{font-weight:700;font-size:16px;border-top:2px solid #333;border-bottom:none}
     .box{border:1px solid #ddd;border-radius:8px;padding:12px 16px;margin:12px 0}
-    .badge{display:inline-block;background:#16a34a;color:#fff;padding:4px 12px;border-radius:999px;font-size:13px;font-weight:600}
+    .badge{display:inline-block;background:#3b82f6;color:#fff;padding:4px 12px;border-radius:999px;font-size:13px;font-weight:600}
     footer{margin-top:32px;font-size:12px;color:#888;text-align:center}
     @media print{body{margin:0}.noprint{display:none}}
   </style></head><body>
@@ -722,47 +723,82 @@ async function sendEmail({ to, subject, html }) {
 }
 
 function htmlWelcome(user, empresa) {
-  return `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Bienvenido a OmniMargen</title></head>
-<body style="font-family:sans-serif;max-width:560px;margin:40px auto;color:#222">
-<h1 style="color:#16a34a">Bienvenido a OmniMargen</h1>
-<p>Hola <strong>${user.nombre || 'Usuario'}</strong>,</p>
-<p>Tu cuenta fue creada exitosamente.</p>
-${empresa ? `<p><strong>Empresa:</strong> ${empresa.nombre} (${empresa.pais}-${empresa.documento})</p>
-<p>Tu empresa ya está lista. Desde la app <strong>TOG Admin</strong> o <strong>OmniServ</strong> podés sincronizar tu licencia con estos datos:</p>
-<ul>
-  <li><strong>País:</strong> ${empresa.pais}</li>
-  <li><strong>Documento:</strong> ${empresa.documento}</li>
-  <li><strong>API Key:</strong> <code>${empresa.api_key}</code></li>
-</ul>` : '<p>No vinculaste una empresa. Podés hacerlo más tarde desde tu cuenta.</p>'}
-<p style="margin-top:24px"><a href="https://omnimargen.site/cuenta" style="background:#16a34a;color:#fff;padding:10px 20px;border-radius:6px;text-decoration:none;display:inline-block">Ir a mi cuenta</a></p>
-<p style="color:#666;margin-top:32px;font-size:13px">Si no creaste esta cuenta, podés ignorar este mensaje.</p>
-</body></html>`
+  const inner = `
+<p style="margin:0 0 16px;font-size:16px;color:#374151">Hola <strong>${escapeHtml(user.nombre || 'Usuario')}</strong>,</p>
+<p style="margin:0 0 16px;font-size:16px;color:#374151">Tu cuenta fue creada exitosamente.</p>
+${empresa ? `<div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:16px;margin:16px 0">
+  <p style="margin:0 0 8px;font-size:14px;color:#166534"><strong>Empresa:</strong> ${escapeHtml(empresa.nombre)} (${escapeHtml(empresa.pais)}-${escapeHtml(empresa.documento)})</p>
+  <p style="margin:0 0 8px;font-size:14px;color:#374151">Desde la app <strong>TOG Admin</strong> o <strong>OmniServ</strong> podés sincronizar tu licencia con estos datos:</p>
+  <table role="presentation" cellpadding="0" cellspacing="0" style="margin:8px 0">
+    <tr><td style="padding:4px 0;font-size:14px;color:#6b7280">País:</td><td style="padding:4px 0 4px 8px;font-size:14px;color:#374151;font-weight:600">${escapeHtml(empresa.pais)}</td></tr>
+    <tr><td style="padding:4px 0;font-size:14px;color:#6b7280">Documento:</td><td style="padding:4px 0 4px 8px;font-size:14px;color:#374151;font-weight:600">${escapeHtml(empresa.documento)}</td></tr>
+    <tr><td style="padding:4px 0;font-size:14px;color:#6b7280">API Key:</td><td style="padding:4px 0 4px 8px;font-size:14px;color:#374151;font-weight:600"><code style="background:#f3f4f6;padding:2px 6px;border-radius:4px;font-size:13px">${escapeHtml(empresa.api_key)}</code></td></tr>
+  </table>
+</div>` : '<p style="margin:16px 0;font-size:14px;color:#6b7280">No vinculaste una empresa. Podés hacerlo más tarde desde tu cuenta.</p>'}
+<table role="presentation" cellpadding="0" cellspacing="0" style="margin:24px 0">
+  <tr>
+    <td style="background-color:#3b82f6;border-radius:8px">
+      <a href="${SITE_URL}/cuenta" style="display:inline-block;padding:12px 24px;color:#ffffff;font-size:14px;font-weight:600;text-decoration:none">Ir a mi cuenta</a>
+    </td>
+  </tr>
+</table>`
+
+  return wrapEmail('Bienvenido a OmniMargen', inner, {
+    unsubscribe: `${SITE_URL}/cuenta#baja`,
+    preheader: 'Tu cuenta fue creada exitosamente.',
+  })
 }
 
 function htmlRenewalReminder(user, empresa, diasRestantes) {
-  const urgenStyle = diasRestantes <= 7 ? 'color:#dc2626;font-weight:bold' : 'color:#d97706'
-  return `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Tu licencia vence pronto</title></head>
-<body style="font-family:sans-serif;max-width:560px;margin:40px auto;color:#222">
-<h1 style="${urgenStyle}">Tu licencia vence en ${diasRestantes} día${diasRestantes === 1 ? '' : 's'}</h1>
-<p>Hola <strong>${user.nombre || 'Usuario'}</strong>,</p>
-${empresa ? `<p>La licencia de <strong>${empresa.nombre}</strong> vence el <strong>${empresa.fecha_expiracion || 'próximamente'}</strong>.</p>` : ''}
-<p>Para evitar la interrupción del servicio, renová tu licencia desde la app o desde tu cuenta web.</p>
-<p style="margin-top:24px"><a href="https://omnimargen.site/cuenta" style="background:#16a34a;color:#fff;padding:10px 20px;border-radius:6px;text-decoration:none;display:inline-block">Renovar ahora</a></p>
-<p style="color:#666;margin-top:32px;font-size:13px">Si ya renovaste, podés ignorar este mensaje.</p>
-</body></html>`
+  const urgencyColor = diasRestantes <= 7 ? '#dc2626' : '#d97706'
+  const urgencyLabel = diasRestantes <= 7 ? 'URGENTE' : 'IMPORTANTE'
+  const inner = `
+<table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 0 16px;width:100%">
+  <tr>
+    <td style="background:${urgencyColor};border-radius:8px;padding:12px 16px;text-align:center">
+      <p style="margin:0;color:#ffffff;font-size:14px;font-weight:700">${urgencyLabel}: Tu licencia vence en ${diasRestantes} día${diasRestantes === 1 ? '' : 's'}</p>
+    </td>
+  </tr>
+</table>
+<p style="margin:0 0 16px;font-size:16px;color:#374151">Hola <strong>${escapeHtml(user.nombre || 'Usuario')}</strong>,</p>
+${empresa ? `<p style="margin:0 0 16px;font-size:14px;color:#374151">La licencia de <strong>${escapeHtml(empresa.nombre)}</strong> vence el <strong>${escapeHtml(empresa.fecha_expiracion || 'próximamente')}</strong>.</p>` : ''}
+<p style="margin:0 0 16px;font-size:14px;color:#374151">Para evitar la interrupción del servicio, renová tu licencia desde la app o desde tu cuenta web.</p>
+<table role="presentation" cellpadding="0" cellspacing="0" style="margin:24px 0">
+  <tr>
+    <td style="background-color:#3b82f6;border-radius:8px">
+      <a href="${SITE_URL}/cuenta" style="display:inline-block;padding:12px 24px;color:#ffffff;font-size:14px;font-weight:600;text-decoration:none">Renovar ahora</a>
+    </td>
+  </tr>
+</table>`
+
+  return wrapEmail('Tu licencia vence pronto', inner, {
+    unsubscribe: `${SITE_URL}/cuenta#baja`,
+    preheader: `Tu licencia vence en ${diasRestantes} día${diasRestantes === 1 ? '' : 's'}. Renová para evitar la interrupción.`,
+  })
 }
 
 function html2FAEstado(user, activado) {
-  return `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>${activado ? '2FA activado' : '2FA desactivado'}</title></head>
-<body style="font-family:sans-serif;max-width:560px;margin:40px auto;color:#222">
-<h1 style="color:${activado ? '#16a34a' : '#dc2626'}">${activado ? 'Verificación en dos pasos ACTIVADA' : 'Verificación en dos pasos DESACTIVADA'}</h1>
-<p>Hola <strong>${user.nombre || 'Usuario'}</strong>,</p>
-<p>${activado
+  const color = activado ? '#3b82f6' : '#dc2626'
+  const icon = activado ? '✅' : '🔒'
+  const inner = `
+<table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 0 16px;width:100%">
+  <tr>
+    <td style="background:${color};border-radius:8px;padding:12px 16px;text-align:center">
+      <p style="margin:0;color:#ffffff;font-size:14px;font-weight:700">${icon} Verificación en dos pasos ${activado ? 'ACTIVADA' : 'DESACTIVADA'}</p>
+    </td>
+  </tr>
+</table>
+<p style="margin:0 0 16px;font-size:16px;color:#374151">Hola <strong>${escapeHtml(user.nombre || 'Usuario')}</strong>,</p>
+<p style="margin:0 0 16px;font-size:14px;color:#374151">${activado
     ? 'Tu cuenta ahora pide un código de tu app de autenticación para las operaciones sensibles (cambio de email, regenerar códigos de respaldo y desactivar 2FA).'
     : 'Tu cuenta ya NO pide código adicional para las operaciones sensibles.'}</p>
-<p><strong>Si no fuiste tú,</strong> cambiá tu contraseña y escribinos a soporte@omnimargen.site de inmediato.</p>
-<p style="color:#666;margin-top:32px;font-size:13px">OmniMargen — omnimargen.site</p>
-</body></html>`
+<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:12px 16px;margin:16px 0">
+  <p style="margin:0;font-size:14px;color:#991b1b"><strong>¿No fuiste tú?</strong> Cambiá tu contraseña y escribinos a <a href="mailto:soporte@omnimargen.site" style="color:#991b1b">soporte@omnimargen.site</a> de inmediato.</p>
+</div>`
+
+  return wrapEmail(activado ? '2FA activada' : '2FA desactivada', inner, {
+    preheader: activado ? 'Tu verificación en dos pasos fue activada.' : 'Tu verificación en dos pasos fue desactivada.',
+  })
 }
 
 async function send2FAEstadoEmail(user, activado) {
@@ -775,29 +811,49 @@ async function send2FAEstadoEmail(user, activado) {
 }
 
 function htmlEmailCambiado(anterior, nuevo) {
-  return `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Tu email cambió</title></head>
-<body style="font-family:sans-serif;max-width:560px;margin:40px auto;color:#222">
-<h1 style="color:#d97706">Tu email de acceso cambió</h1>
-<p>El email de tu cuenta OmniMargen pasó de <strong>${anterior}</strong> a <strong>${nuevo}</strong>.</p>
-<p><strong>Si no fuiste tú,</strong> escribinos ahora a soporte@omnimargen.site: alguien podría tener acceso a tu cuenta.</p>
-<p style="color:#666;margin-top:32px;font-size:13px">OmniMargen — omnimargen.site</p>
-</body></html>`
+  const inner = `
+<table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 0 16px;width:100%">
+  <tr>
+    <td style="background-color:#d97706;border-radius:8px;padding:12px 16px;text-align:center">
+      <p style="margin:0;color:#ffffff;font-size:14px;font-weight:700">📧 Tu email de acceso cambió</p>
+    </td>
+  </tr>
+</table>
+<p style="margin:0 0 16px;font-size:14px;color:#374151">El email de tu cuenta OmniMargen pasó de <strong>${escapeHtml(anterior)}</strong> a <strong>${escapeHtml(nuevo)}</strong>.</p>
+<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:12px 16px;margin:16px 0">
+  <p style="margin:0;font-size:14px;color:#991b1b"><strong>¿No fuiste tú?</strong> Escribinos ahora a <a href="mailto:soporte@omnimargen.site" style="color:#991b1b">soporte@omnimargen.site</a>: alguien podría tener acceso a tu cuenta.</p>
+</div>`
+
+  return wrapEmail('Tu email cambió', inner, {
+    preheader: `Tu email de acceso cambió de ${anterior} a ${nuevo}.`,
+  })
 }
 
 function htmlDeviceChange(empresa, fingerprintNuevo, razon) {
-  return `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Cambio de dispositivo autorizado</title></head>
-<body style="font-family:sans-serif;max-width:560px;margin:40px auto;color:#222">
-<h1 style="color:#d97706">Se cambió el dispositivo de tu licencia</h1>
-<p>Hola,</p>
-<p>El dispositivo autorizado de <strong>${empresa.nombre}</strong> (${empresa.pais} · ${empresa.documento}) acaba de cambiar.</p>
-<div style="border:1px solid #ddd;border-radius:8px;padding:12px 16px;margin:16px 0">
-  <p style="margin:4px 0"><strong>Fecha:</strong> ${new Date().toLocaleString('es-VE', { timeZone: 'UTC' })} UTC</p>
-  <p style="margin:4px 0"><strong>Dispositivo nuevo:</strong> ${fingerprintNuevo ?? '— (desvinculado) —'}</p>
-  <p style="margin:4px 0"><strong>Motivo declarado:</strong> ${razon}</p>
+  const inner = `
+<table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 0 16px;width:100%">
+  <tr>
+    <td style="background-color:#d97706;border-radius:8px;padding:12px 16px;text-align:center">
+      <p style="margin:0;color:#ffffff;font-size:14px;font-weight:700">📱 Se cambió el dispositivo de tu licencia</p>
+    </td>
+  </tr>
+</table>
+<p style="margin:0 0 16px;font-size:16px;color:#374151">Hola,</p>
+<p style="margin:0 0 16px;font-size:14px;color:#374151">El dispositivo autorizado de <strong>${escapeHtml(empresa.nombre)}</strong> (${escapeHtml(empresa.pais)} · ${escapeHtml(empresa.documento)}) acaba de cambiar.</p>
+<div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:16px;margin:16px 0">
+  <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%">
+    <tr><td style="padding:4px 0;font-size:13px;color:#6b7280;width:120px">Fecha:</td><td style="padding:4px 0;font-size:13px;color:#374151;font-weight:500">${escapeHtml(new Date().toLocaleString('es-VE', { timeZone: 'UTC' }))} UTC</td></tr>
+    <tr><td style="padding:4px 0;font-size:13px;color:#6b7280">Dispositivo nuevo:</td><td style="padding:4px 0;font-size:13px;color:#374151;font-weight:500"><code style="background:#f3f4f6;padding:2px 6px;border-radius:4px;font-size:12px">${escapeHtml(fingerprintNuevo ?? '— (desvinculado) —')}</code></td></tr>
+    <tr><td style="padding:4px 0;font-size:13px;color:#6b7280">Motivo:</td><td style="padding:4px 0;font-size:13px;color:#374151;font-weight:500">${escapeHtml(razon)}</td></tr>
+  </table>
 </div>
-<p><strong>Si no solicitaste este cambio,</strong> responde a este correo de inmediato: alguien podría estar intentando activar tu licencia en otro equipo.</p>
-<p style="color:#666;margin-top:32px;font-size:13px">OmniMargen — omnimargen.site · soporte@omnimargen.site</p>
-</body></html>`
+<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:12px 16px;margin:16px 0">
+  <p style="margin:0;font-size:14px;color:#991b1b"><strong>¿No solicitaste este cambio?</strong> Responde a este correo de inmediato: alguien podría estar intentando activar tu licencia en otro equipo.</p>
+</div>`
+
+  return wrapEmail('Cambio de dispositivo autorizado', inner, {
+    preheader: `El dispositivo autorizado de tu licencia fue cambiado.`,
+  })
 }
 
 async function sendDeviceChangeEmail(empresa, fingerprintNuevo, razon) {
