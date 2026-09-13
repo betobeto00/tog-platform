@@ -817,18 +817,18 @@ async function enviarRecordatoriosRenovacion() {
   const en7dias = new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0]
   const en3dias = new Date(Date.now() + 3 * 86400000).toISOString().split('T')[0]
   const porVencer = await db.prepare(
-    `SELECT l.empresa_id, l.expira, e.nombre, e.email_contacto
+    `SELECT l.empresa_id, l.expires_at, e.nombre, e.email_contacto
      FROM licencias l JOIN empresas e ON e.id = l.empresa_id
-     WHERE l.revoked_at IS NULL AND l.expira IN ($1, $2)`
+     WHERE l.revoked_at IS NULL AND l.expires_at IN ($1, $2)`
   ).all(en7dias, en3dias)
   for (const lic of porVencer) {
     if (!lic.email_contacto) continue
-    const diasRestantes = Math.ceil((new Date(lic.expira) - Date.now()) / 86400000)
+    const diasRestantes = Math.ceil((new Date(lic.expires_at) - Date.now()) / 86400000)
     const user = await db.prepare('SELECT nombre FROM users WHERE empresa_id = $1 LIMIT 1').get(lic.empresa_id)
     await sendEmail({
       to: lic.email_contacto,
       subject: `Tu licencia vence en ${diasRestantes} día${diasRestantes === 1 ? '' : 's'} — OmniMargen`,
-      html: htmlRenewalReminder(user || { nombre: lic.email_contacto }, { nombre: lic.nombre, fecha_expiracion: lic.expira }, diasRestantes),
+      html: htmlRenewalReminder(user || { nombre: lic.email_contacto }, { nombre: lic.nombre, fecha_expiracion: lic.expires_at }, diasRestantes),
     }).catch(() => {})
   }
 }
@@ -962,6 +962,59 @@ async function handle(req, res) {
 
     const row = await db.prepare('SELECT id, device_fingerprint FROM empresas WHERE id = $1').get(empresaId)
     return json(res, 200, { success: true, empresa_id: row.id, device_fingerprint: row.device_fingerprint })
+  }
+
+  // POST /api/empresas/:id/rebind — el propio cliente re-vincula su dispositivo.
+  // Misma lógica que el endpoint admin pero autenticado con x-api-key (no admin key).
+  const rebindMatch = path.match(/^\/api\/empresas\/(\d+)\/rebind$/)
+  if (method === 'POST' && rebindMatch) {
+    const empresa = await requireEmpresa(req, res)
+    if (!empresa) return
+    const empresaId = Number(rebindMatch[1])
+    if (empresa.id !== empresaId) {
+      return json(res, 403, { success: false, error: 'No autorizado para rebind de otra empresa' })
+    }
+
+    const body = await readBody(req)
+    const nuevo = typeof body?.device_fingerprint === 'string' ? body.device_fingerprint.trim() : ''
+    if (!nuevo || !/^[a-fA-F0-9]{16,128}$/.test(nuevo)) {
+      return json(res, 400, { success: false, error: 'device_fingerprint requerido (hex 16-128 chars)' })
+    }
+
+    const limiteFecha = new Date(Date.now() - DEVICE_CHANGE_COOLDOWN_HOURS * 3600_000).toISOString().replace('T', ' ').slice(0, 19)
+    const ultimo = await db
+      .prepare('SELECT id, created_at FROM device_fingerprint_audit WHERE empresa_id = $1 AND created_at >= $2 ORDER BY id DESC LIMIT 1')
+      .get(empresaId, limiteFecha)
+    if (ultimo) {
+      return json(res, 429, {
+        success: false,
+        error: `Ya se cambió el dispositivo hace menos de ${DEVICE_CHANGE_COOLDOWN_HOURS}h. Intenta más tarde.`,
+        ultimo_cambio: ultimo.created_at,
+      })
+    }
+
+    const antiguo = empresa.device_fingerprint
+    await db.prepare('UPDATE empresas SET device_fingerprint = $1 WHERE id = $2').run(nuevo, empresaId)
+
+    await db.prepare(
+      `INSERT INTO device_fingerprint_audit
+         (empresa_id, admin_key_hash, admin_email, fingerprint_antiguo, fingerprint_nuevo, razon, ip_address, user_agent)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
+    ).run(
+      empresaId,
+      null,
+      empresa.email_contacto || null,
+      antiguo,
+      nuevo,
+      'Re-vinculación desde el cliente',
+      ip,
+      String(req.headers['user-agent'] || '').slice(0, 200),
+    )
+
+    console.log(`[rebind] empresa ${empresaId}: ${antiguo || '(sin previo)'} → ${nuevo}`)
+    sendDeviceChangeEmail(empresa, nuevo, 'Re-vinculación desde el cliente').catch(() => {})
+
+    return json(res, 200, { success: true, empresa_id: empresaId, device_fingerprint: nuevo })
   }
 
   // GET /api/admin/empresas/:id/audit/dispositivo (admin)
