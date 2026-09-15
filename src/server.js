@@ -2,7 +2,7 @@ import http from 'node:http'
 import crypto from 'node:crypto'
 import { pathToFileURL } from 'node:url'
 import { db, getActiveLicense, closeDatabase, withTransaction, NOW } from './db.js'
-import { signLicense, loadPrivateKey, MODULE_IDS } from './sign.js'
+import { signLicense, loadPrivateKey, MODULE_IDS, MODULOS_VENDIBLES } from './sign.js'
 import {
   cifrar,
   descifrar,
@@ -425,7 +425,9 @@ async function requiereStepUp(user, req, res) {
 const PRECIOS_TOG = { mensual: 15, trimestral: 40, anual: 150 }
 const EXTRA_MODULO_MENSUAL = 3
 const MESES_POR_PERIODO = { mensual: 1, trimestral: 3, anual: 12 }
-const MODULOS_EXTRA = MODULE_IDS.filter((m) => m !== 'comercializador' && m !== 'omniserv' && m !== 'rrhh')
+// Única fuente: lo que se puede firmar en sign.js. Antes esta lista se repetía
+// acá y se desincronizó (faltaba `hipico`).
+const MODULOS_EXTRA = MODULOS_VENDIBLES
 
 function precioModulosExtra(periodo, modulos) {
   const meses = MESES_POR_PERIODO[periodo] || 1
