@@ -182,6 +182,23 @@ export async function vincularEmpresaConVendedor({ empresa, vendedor, licencia =
 }
 
 /**
+ * Monto, moneda y periodo de la comisión que le corresponde a un pago.
+ * Función pura: la usan tanto el registro en la base como el aviso por
+ * Telegram, para que no haya dos formas de calcular el mismo monto.
+ * Devuelve null si el pago no genera comisión.
+ */
+export function detalleComision({ pago, mesesPorPeriodo = {}, porcentaje, moneda = 'USD' }) {
+  const base = Number(pago?.monto)
+  if (!Number.isFinite(base) || base <= 0) return null
+
+  const { monto: mensual, periodo } = montoMensualDePago(pago, mesesPorPeriodo)
+  const monto = calcularComision(mensual ?? base, porcentaje)
+  if (monto <= 0) return null
+
+  return { monto, moneda: moneda || 'USD', periodo }
+}
+
+/**
  * Registra la comisión de un pago confirmado. Idempotente por
  * (cliente, periodo): si ya existe una comisión de ese mes para ese cliente, no
  * la duplica. Devuelve 1 si creó la fila, 0 si no había nada que hacer.
@@ -189,16 +206,17 @@ export async function vincularEmpresaConVendedor({ empresa, vendedor, licencia =
 export async function registrarComisionDePago({ vendedor, clienteId, pago, mesesPorPeriodo = {}, moneda = 'USD' }) {
   if (!vendedor?.id || !clienteId || !pago) return 0
 
-  const base = Number(pago.monto)
-  if (!Number.isFinite(base) || base <= 0) return 0
-
-  const { monto: mensual, periodo } = montoMensualDePago(pago, mesesPorPeriodo)
-  const monto = calcularComision(mensual ?? base, vendedor.comision_porcentaje)
-  if (monto <= 0) return 0
+  const detalle = detalleComision({
+    pago,
+    mesesPorPeriodo,
+    porcentaje: vendedor.comision_porcentaje,
+    moneda,
+  })
+  if (!detalle) return 0
 
   const yaExiste = await db
     .prepare('SELECT id FROM vendedor_comisiones WHERE cliente_id = $1 AND periodo = $2 LIMIT 1')
-    .get(clienteId, periodo)
+    .get(clienteId, detalle.periodo)
   if (yaExiste) return 0
 
   await db
@@ -206,7 +224,7 @@ export async function registrarComisionDePago({ vendedor, clienteId, pago, meses
       `INSERT INTO vendedor_comisiones (vendedor_id, cliente_id, monto, moneda, periodo, estado)
        VALUES ($1, $2, $3, $4, $5, 'pendiente')`,
     )
-    .run(vendedor.id, clienteId, monto, moneda || 'USD', periodo)
+    .run(vendedor.id, clienteId, detalle.monto, detalle.moneda, detalle.periodo)
 
   return 1
 }
@@ -230,5 +248,18 @@ export async function registrarComisionDePagoConfirmado({ empresa, pago, mesesPo
   if (!cliente) return { registrada: false, motivo: 'cliente del vendedor no encontrado' }
 
   const creadas = await registrarComisionDePago({ vendedor, clienteId: cliente.id, pago, mesesPorPeriodo })
-  return { registrada: creadas > 0, motivo: creadas > 0 ? 'ok' : 'comisión ya registrada para el periodo' }
+  if (creadas <= 0) return { registrada: false, motivo: 'comisión ya registrada para el periodo' }
+
+  // Detalle para poder avisarle al vendedor (ver src/telegram.js).
+  const detalle = detalleComision({
+    pago,
+    mesesPorPeriodo,
+    porcentaje: vendedor.comision_porcentaje,
+  })
+
+  return {
+    registrada: true,
+    motivo: 'ok',
+    detalle: detalle ? { ...detalle, cliente: empresa.nombre } : null,
+  }
 }

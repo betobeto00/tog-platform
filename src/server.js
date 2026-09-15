@@ -20,6 +20,7 @@ import {
   vincularEmpresaConVendedor,
   registrarComisionDePagoConfirmado,
 } from './vendedores.js'
+import { avisarComisionAcreditada, motivoParaRevisar } from './telegram.js'
 
 const PORT = Number(process.env.PORT || 3001)
 const PRIVATE_KEY_PATH = process.env.LICENSE_PRIVATE_KEY_PATH || './keys/private.key'
@@ -560,6 +561,21 @@ async function confirmarPago(pago, { providerRef = null, por = `crixto:${pago.id
     })
     if (!comision.registrada && comision.motivo !== 'empresa sin vendedor') {
       console.warn(`[vendedores] comisión no registrada (empresa ${empresa.id}): ${comision.motivo}`)
+    }
+
+    // El vendedor se entera por Telegram de que cobró, sin entrar al panel.
+    // Igual de best-effort que el registro de la comisión.
+    if (comision.registrada && comision.detalle) {
+      const aviso = await avisarComisionAcreditada({
+        idVendedor: empresa.vendedor_id,
+        cliente: comision.detalle.cliente,
+        monto: comision.detalle.monto,
+        moneda: comision.detalle.moneda,
+        periodo: comision.detalle.periodo,
+      })
+      if (motivoParaRevisar(aviso.motivo)) {
+        console.warn(`[telegram] aviso de comisión no enviado (empresa ${empresa.id}): ${aviso.motivo}`)
+      }
     }
   } catch (err) {
     console.error(`[vendedores] error al registrar comisión (empresa ${empresa.id}):`, err.message)

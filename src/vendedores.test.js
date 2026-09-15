@@ -35,6 +35,7 @@ const { isPostgres } = await import('./db.js')
 const {
   validarIdVendedor,
   calcularComision,
+  detalleComision,
   periodoDeFecha,
   montoMensualDePago,
   tablasVendedoresDisponibles,
@@ -167,6 +168,28 @@ test('montoMensualDePago lleva un pago anual a su equivalente mensual', () => {
   const pago = { monto: 150, detalle: JSON.stringify({ periodo: 'anual' }), paid_at: '2026-03-15 10:00:00' }
   assert.deepEqual(montoMensualDePago(pago, { anual: 12 }), { monto: 12.5, periodo: '2026-03', moneda: 'USD' })
   assert.equal(periodoDeFecha('2026-03-15 10:00:00'), '2026-03')
+})
+
+test('detalleComision: monto, moneda y periodo que se avisan al vendedor', () => {
+  const pago = {
+    monto: 15,
+    detalle: JSON.stringify({ periodo: 'mensual' }),
+    paid_at: '2026-09-15 10:00:00',
+  }
+  // 30% de 15 = 4.5, periodo del pago.
+  assert.deepEqual(detalleComision({ pago, porcentaje: 30 }), {
+    monto: 4.5,
+    moneda: 'USD',
+    periodo: '2026-09',
+  })
+  // El pago anual se prorratea antes de calcular la comisión.
+  const anual = { monto: 150, detalle: JSON.stringify({ periodo: 'anual' }), paid_at: '2026-03-01' }
+  assert.equal(detalleComision({ pago: anual, porcentaje: 30, mesesPorPeriodo: { anual: 12 } }).monto, 3.75)
+  // Sin comisión no hay detalle (ni aviso).
+  assert.equal(detalleComision({ pago: { monto: 0 }, porcentaje: 30 }), null)
+  assert.equal(detalleComision({ pago: { monto: 'mucho' }, porcentaje: 30 }), null)
+  assert.equal(detalleComision({ pago, porcentaje: 0 }), null)
+  assert.equal(detalleComision({}), null)
 })
 
 test('vincular rechaza formatos inválidos y entornos sin vendedores', async () => {
