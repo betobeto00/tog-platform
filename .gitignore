@@ -24,3 +24,6 @@ data-smoke/
 
 # Logs de runtime
 *.log
+
+# Supabase local temp
+supabase/.temp/

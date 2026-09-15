@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Vinculación empresa ↔ vendedor (FASE 5)** — `src/vendedores.js`, `POST /api/empresas/:id/vendedor`
+  (auth por `x-api-key`), guarda `empresas.vendedor_id` (OMV-XXXXX), crea/actualiza el cliente
+  en `vendedor_clientes` y registra la comisión (30% por defecto, idempotente por periodo).
+  La comisión también se registra al confirmar un pago, best-effort: nunca rompe el cobro.
+- `supabase/migrations/002_vendedores_auth.sql`: `vendedores.password_hash` + `telegram_verificado_en`
+- `docs/SUPABASE.md`: modo Postgres/Supabase, RLS, transacciones y cómo certificar la rama Postgres
+- `src/vendedores.test.js`: 7 tests (5 corren también en SQLite, 2 sólo en Postgres)
+
+### Fixed
+- `src/schema.sql`: `empresas.vendedor_id` es `TEXT`. La versión sin commitear
+  (`INTEGER REFERENCES vendedores(id)`) rompía las dos ramas — en Postgres
+  `relation "vendedores" does not exist` y en SQLite fallaban todos los INSERT
+  (que el handler reportaba como `409 Documento duplicado`).
+- **Bugs que sólo aparecían en Postgres** (destapados al certificar la rama):
+  - `SET usado = TRUE` sobre una columna `INTEGER` → error de tipo al hacer forgot/reset-password
+  - `db.exec('BEGIN')` sobre el pool no abría transacción (cada query podía salir por
+    otra conexión) → nuevo `withTransaction()` en `src/db.js`
+- `supabase/migrations/001_rls_policies.sql`: el bloque de tablas de vendedores estaba
+  duplicado (`CREATE POLICY`/`CREATE INDEX` sin `IF NOT EXISTS`), aplicar el archivo fallaba
+
+### Changed
+- `src/db.js`: exporta `isPostgres`, agrega migraciones idempotentes de columnas nuevas
+  (`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`) y `withTransaction()`
+- `.env.example` / `AGENTS.md`: `DATABASE_URL` documentada como obligatoria en producción
+  (sin ella el backend corre en SQLite efímero y pierde datos en cada deploy)
+
+### Added
 - **Crixto payment flow** (canonical provider, replaces Stripe):
   - `docs/FACTURACION-CRIXTO.md`: canonical payment documentation
   - 3 license paths operational: manual script, admin panel, online Crixto

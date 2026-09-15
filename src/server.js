@@ -1,7 +1,7 @@
 import http from 'node:http'
 import crypto from 'node:crypto'
 import { pathToFileURL } from 'node:url'
-import { db, getActiveLicense, closeDatabase, NOW } from './db.js'
+import { db, getActiveLicense, closeDatabase, withTransaction, NOW } from './db.js'
 import { signLicense, loadPrivateKey, MODULE_IDS } from './sign.js'
 import {
   cifrar,
@@ -13,6 +13,13 @@ import {
   verifyTOTP,
 } from './totp.js'
 import { wrapEmail, escapeHtml } from './email-template.js'
+import {
+  validarIdVendedor,
+  tablasVendedoresDisponibles,
+  buscarVendedor,
+  vincularEmpresaConVendedor,
+  registrarComisionDePagoConfirmado,
+} from './vendedores.js'
 
 const PORT = Number(process.env.PORT || 3001)
 const PRIVATE_KEY_PATH = process.env.LICENSE_PRIVATE_KEY_PATH || './keys/private.key'
@@ -540,6 +547,22 @@ async function confirmarPago(pago, { providerRef = null, por = `crixto:${pago.id
   const pagoConfirmado = await db.prepare('SELECT * FROM pagos WHERE id = $1').get(pago.id)
   const user = pago.user_id ? await db.prepare('SELECT * FROM users WHERE id = $1').get(pago.user_id) : null
   sendInvoiceEmail(pagoConfirmado, empresa, user)
+
+  // Si la empresa está vinculada a un vendedor, su comisión del periodo queda
+  // registrada. Es best-effort: un fallo acá nunca debe romper el cobro.
+  try {
+    const comision = await registrarComisionDePagoConfirmado({
+      empresa,
+      pago: pagoConfirmado,
+      mesesPorPeriodo: MESES_POR_PERIODO,
+    })
+    if (!comision.registrada && comision.motivo !== 'empresa sin vendedor') {
+      console.warn(`[vendedores] comisión no registrada (empresa ${empresa.id}): ${comision.motivo}`)
+    }
+  } catch (err) {
+    console.error(`[vendedores] error al registrar comisión (empresa ${empresa.id}):`, err.message)
+  }
+
   return { nroFactura, empresa, pago: pagoConfirmado }
 }
 
@@ -1278,18 +1301,12 @@ async function handle(req, res) {
     const user = await db.prepare('SELECT id FROM users WHERE email = $1').get(email)
     if (user) {
       const expira = new Date(Date.now() + 60 * 60 * 1000).toISOString()
-      await db.exec('BEGIN')
-      try {
-        await db.prepare('UPDATE password_resets SET usado = TRUE WHERE user_id = $1').run(user.id)
-        await db.prepare('INSERT INTO password_resets (user_id, token_hash, expira) VALUES ($1, $2, $3)').run(user.id, tokenHash, expira)
+      await withTransaction(async (tx) => {
+        // `usado` es INTEGER en ambos motores: TRUE sólo funciona en SQLite.
+        await tx.prepare('UPDATE password_resets SET usado = 1 WHERE user_id = $1').run(user.id)
+        await tx.prepare('INSERT INTO password_resets (user_id, token_hash, expira) VALUES ($1, $2, $3)').run(user.id, tokenHash, expira)
         console.log(`[forgot] STORED user=${user.id} email=${email} hash=${tokenHash.slice(0, 8)}… expires=${expira}`)
-        await db.exec('COMMIT')
-      } catch (err) {
-        try {
-          await db.exec('ROLLBACK')
-        } catch {}
-        throw err
-      }
+      })
     } else {
       console.log(`[forgot] USER NOT FOUND email=${email}`)
     }
@@ -1315,7 +1332,7 @@ async function handle(req, res) {
       return json(res, 400, { success: false, error: 'Token expirado. Solicita un nuevo enlace.' })
     }
     await db.prepare(`UPDATE users SET password_hash = $1, updated_at = ${NOW} WHERE id = $2`).run(hashPassword(password), row.user_id)
-    await db.prepare('UPDATE password_resets SET usado = TRUE WHERE id = $1').run(row.id)
+    await db.prepare('UPDATE password_resets SET usado = 1 WHERE id = $1').run(row.id)
     return json(res, 200, { success: true, message: 'Contraseña actualizada. Ya puedes iniciar sesión.' })
   }
 
@@ -1411,24 +1428,17 @@ async function handle(req, res) {
     }
 
     const codigos = generateBackupCodes(TWOFA_BACKUP_CODE_COUNT)
-    await db.exec('BEGIN')
-    try {
-      await db
+    await withTransaction(async (tx) => {
+      await tx
         .prepare(`UPDATE two_factor_auth SET verified = 1, confirmed_at = ${NOW}, last_used_at = ${NOW} WHERE user_id = $1`)
         .run(user.id)
-      await db.prepare('DELETE FROM two_factor_backup_codes WHERE user_id = $1').run(user.id)
+      await tx.prepare('DELETE FROM two_factor_backup_codes WHERE user_id = $1').run(user.id)
       for (const codigo of codigos) {
-        await db
+        await tx
           .prepare('INSERT INTO two_factor_backup_codes (user_id, code_hash) VALUES ($1, $2)')
           .run(user.id, hashBackupCode(codigo, material2FA()))
       }
-      await db.exec('COMMIT')
-    } catch (err) {
-      try {
-        await db.exec('ROLLBACK')
-      } catch {}
-      throw err
-    }
+    })
 
     send2FAEstadoEmail(user, true).catch(() => {})
     return json(res, 200, {
@@ -1517,17 +1527,10 @@ async function handle(req, res) {
       return json(res, 401, { success: false, error: 'Código 2FA inválido' })
     }
 
-    await db.exec('BEGIN')
-    try {
-      await db.prepare('DELETE FROM two_factor_auth WHERE user_id = $1').run(user.id)
-      await db.prepare('DELETE FROM two_factor_backup_codes WHERE user_id = $1').run(user.id)
-      await db.exec('COMMIT')
-    } catch (err) {
-      try {
-        await db.exec('ROLLBACK')
-      } catch {}
-      throw err
-    }
+    await withTransaction(async (tx) => {
+      await tx.prepare('DELETE FROM two_factor_auth WHERE user_id = $1').run(user.id)
+      await tx.prepare('DELETE FROM two_factor_backup_codes WHERE user_id = $1').run(user.id)
+    })
 
     send2FAEstadoEmail(user, false).catch(() => {})
     return json(res, 200, { success: true, message: '2FA desactivado' })
@@ -1854,6 +1857,68 @@ async function handle(req, res) {
       return json(res, 404, { success: false, error: 'Sin licencia activa' })
     }
     return json(res, 200, { success: true, licencia: JSON.parse(licencia.payload_json) })
+  }
+
+  // POST /api/empresas/:id/vendedor (api_key) — vincula el cliente con el
+  // vendedor que lo trajo (FASE 5). El ID que llega es el humano (OMV-XXXXX) y
+  // se guarda tal cual en `empresas.vendedor_id`; el vendedor y sus clientes
+  // viven en las tablas de Supabase (ver src/vendedores.js).
+  const vendedorMatch = path.match(/^\/api\/empresas\/(\d+)\/vendedor$/)
+  if (method === 'POST' && vendedorMatch) {
+    const empresa = await requireEmpresa(req, res)
+    if (!empresa) return
+    if (Number(vendedorMatch[1]) !== empresa.id) {
+      return json(res, 403, { success: false, error: 'La API key no corresponde a esa empresa' })
+    }
+
+    const body = await readBody(req)
+    const { id: idVendedor, valido } = validarIdVendedor(body?.id_vendedor)
+    if (!valido) {
+      return json(res, 400, { success: false, error: 'ID de vendedor inválido (formato esperado: OMV-XXXXX)' })
+    }
+
+    if (!(await tablasVendedoresDisponibles())) {
+      return json(res, 503, {
+        success: false,
+        error: 'El sistema de vendedores no está disponible en este entorno',
+      })
+    }
+
+    const vendedor = await buscarVendedor(idVendedor)
+    if (!vendedor) {
+      return json(res, 404, { success: false, error: `No existe un vendedor con el ID ${idVendedor}` })
+    }
+    if (!vendedor.activo) {
+      return json(res, 409, { success: false, error: `El vendedor ${idVendedor} está desactivado` })
+    }
+
+    const licencia = await getActiveLicense(empresa.id)
+    const pagos = await db
+      .prepare("SELECT * FROM pagos WHERE empresa_id = $1 AND estado = 'confirmed' ORDER BY paid_at, id")
+      .all(empresa.id)
+
+    let resultado
+    try {
+      resultado = await vincularEmpresaConVendedor({
+        empresa,
+        vendedor,
+        licencia,
+        pagos,
+        mesesPorPeriodo: MESES_POR_PERIODO,
+      })
+    } catch (err) {
+      console.error('[vendedores] error al vincular empresa:', err.message)
+      return json(res, 500, { success: false, error: 'No se pudo vincular el vendedor' })
+    }
+
+    return json(res, 200, {
+      success: true,
+      vendedor: { id_vendedor: vendedor.id_vendedor, nombre: vendedor.nombre },
+      cliente_id: resultado.cliente_id,
+      cliente_creado: resultado.cliente_creado,
+      comisiones_creadas: resultado.comisiones_creadas,
+      monto_mensual: resultado.monto_mensual,
+    })
   }
 
   // GET /api/admin/jobs/verify-pending-payments (admin)

@@ -13,8 +13,11 @@ TOG Admin (offline-first). **No** contiene UI ni app desktop.
 
 ## Stack y reglas
 
-- Node ≥22.5, ESM (`"type": "module"`), **cero dependencias runtime**.
-- SQLite: `src/db.js` (capa de datos) + `src/schema.sql` (esquema).
+- Node ≥22.5, ESM (`"type": "module"`), **una sola dependencia runtime: `pg`**.
+- Base de datos dual en `src/db.js` (capa de datos) + `src/schema.sql` (esquema):
+  **Postgres/Supabase en producción** (si hay `DATABASE_URL`) y **SQLite en dev/tests**
+  (si no la hay). Detalle, transacciones y queries portables: `docs/SUPABASE.md`.
+  Decisión del ecosistema: `../docs/DECISION_BASE_DE_DATOS.md`.
 - Tests con `node:test` (`npm test` corre `src/*.test.js`).
 - Responder en español. Commits en inglés, una línea, imperativo.
 - NO commitear sin que el usuario lo pida. NUNCA commitear secretos
@@ -27,11 +30,13 @@ TOG Admin (offline-first). **No** contiene UI ni app desktop.
 ```
 src/
 ├── server.js     # HTTP server (rutas + pagos) — entry point (npm start / dev)
-├── db.js         # Capa SQLite/Postgres (empresas, licencias, pagos, users)
+├── db.js         # Capa Postgres/SQLite (empresas, licencias, pagos, users) + withTransaction
 ├── schema.sql    # Esquema de la DB
+├── vendedores.js # Vinculación empresa↔vendedor y comisiones (tablas de la landing)
 ├── sign.js       # Firma/verificación RSA de licencias
-└── *.test.js     # Suites node:test (server, account, security)
-docs/             # MODULOS.md, ARQUITECTURA-MODULAR.md, FACTURACION-CRIXTO.md, bitácoras
+└── *.test.js     # Suites node:test (server, account, security, vendedores)
+supabase/migrations/  # RLS + tablas de vendedores (aplicar a mano en Supabase)
+docs/             # MODULOS.md, ARQUITECTURA-MODULAR.md, FACTURACION-CRIXTO.md, SUPABASE.md, bitácoras
 ```
 
 ## Comandos
@@ -46,11 +51,14 @@ docs/             # MODULOS.md, ARQUITECTURA-MODULAR.md, FACTURACION-CRIXTO.md, 
 ## Env vars
 
 Obligatorias: `ADMIN_API_KEY`, `JWT_SECRET`, `PAYMENT_HMAC_SECRET`.
+Producción: `DATABASE_URL` (Postgres de Supabase) — si falta, el backend corre en
+SQLite efímero y **pierde datos en cada deploy** (no hay chequeo que lo impida
+porque los tests corren sin ella).
 Opcionales: `PORT`, `LICENSE_PRIVATE_KEY_PATH`, `TOG_PLATFORM_DATA`,
 `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW_MS`, `RESEND_API_KEY`, `INVOICE_FROM`,
 `SECURITY_ALERT_EMAIL`, `SITE_URL`, `PAYMENT_HMAC_WINDOW_SECONDS`,
 `PAYMENT_CONFIRM_MAX_PER_MINUTE`, `PENDING_PAYMENT_TTL_HOURS`,
-`DEVICE_CHANGE_COOLDOWN_HOURS`. Ver `.env.example` y
+`DEVICE_CHANGE_COOLDOWN_HOURS`. Ver `.env.example`, `docs/SUPABASE.md` y
 `docs/FACTURACION-CRIXTO.md`.
 
 **No hay Stripe.** El único proveedor de pago es Crixto; si algo vuelve a

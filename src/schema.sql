@@ -12,6 +12,11 @@ CREATE TABLE IF NOT EXISTS empresas (
   device_fingerprint TEXT,
   payment_status     TEXT DEFAULT 'pending',
   payment_confirmed_at TEXT,
+  -- ID de vendedor que trajo al cliente, con el formato humano OMV-XXXXX
+  -- (ver src/vendedores.js). Es TEXT a propósito: la tabla `vendedores` vive en
+  -- Supabase con PK UUID y en SQLite (dev/test) no existe, así que no puede
+  -- haber FK aquí — la vinculación se valida en la API, no en el motor.
+  vendedor_id        TEXT,
   created_at         TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE (pais, documento)
 );
