@@ -14,8 +14,9 @@ Thumbs.db
 *.pem
 *.key
 
-# Graphify
+#Graphify
 graphify-out/
+.graphifyignore
 
 # Dependencias y datos locales de desarrollo
 node_modules/
