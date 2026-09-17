@@ -994,7 +994,7 @@ async function handle(req, res) {
   // GET /api/admin/empresas (admin)
   if (method === 'GET' && path === '/api/admin/empresas') {
     if (!(await requireAdmin(req, res))) return
-    const rows = await db.prepare('SELECT id, nombre, pais, documento, email_contacto, device_fingerprint, payment_status, created_at FROM empresas ORDER BY created_at DESC').all()
+    const rows = await db.prepare('SELECT id, nombre, pais, documento, email_contacto, device_fingerprint, desktop_machine_id, payment_status, created_at FROM empresas ORDER BY created_at DESC').all()
     return json(res, 200, { empresas: rows })
   }
 
@@ -1006,7 +1006,7 @@ async function handle(req, res) {
     if (!(await requireAdmin(req, res))) return
     const empresaId = Number(adminEmpresaMatch[1])
     const empresa = await db
-      .prepare('SELECT id, nombre, pais, documento, email_contacto, device_fingerprint, payment_status, created_at FROM empresas WHERE id = $1')
+      .prepare('SELECT id, nombre, pais, documento, email_contacto, device_fingerprint, desktop_machine_id, payment_status, created_at FROM empresas WHERE id = $1')
       .get(empresaId)
     if (!empresa) return json(res, 404, { success: false, error: `Empresa #${empresaId} no encontrada` })
 
@@ -1103,6 +1103,8 @@ async function handle(req, res) {
 
   // POST /api/empresas/:id/rebind — el propio cliente re-vincula su dispositivo.
   // Misma lógica que el endpoint admin pero autenticado con x-api-key (no admin key).
+  // Si se envía `desktop_machine_id`, re-vincula el PC desktop (TOG Admin).
+  // Si se envía `device_fingerprint`, re-vincula el teléfono (OmniServ).
   const rebindMatch = path.match(/^\/api\/empresas\/(\d+)\/rebind$/)
   if (method === 'POST' && rebindMatch) {
     const empresa = await requireEmpresa(req, res)
@@ -1113,9 +1115,22 @@ async function handle(req, res) {
     }
 
     const body = await readBody(req)
-    const nuevo = typeof body?.device_fingerprint === 'string' ? body.device_fingerprint.trim() : ''
-    if (!nuevo || !/^[a-fA-F0-9]{16,128}$/.test(nuevo)) {
-      return json(res, 400, { success: false, error: 'device_fingerprint requerido (hex 16-128 chars)' })
+    const desktopMachineId = typeof body?.desktop_machine_id === 'string' ? body.desktop_machine_id.trim() : ''
+    const deviceFingerprint = typeof body?.device_fingerprint === 'string' ? body.device_fingerprint.trim() : ''
+
+    if (desktopMachineId) {
+      // Re-vinculación del PC desktop
+      if (!/^[a-fA-F0-9]{8,128}$/.test(desktopMachineId)) {
+        return json(res, 400, { success: false, error: 'desktop_machine_id debe ser hex de 8 a 128 caracteres' })
+      }
+      await db.prepare('UPDATE empresas SET desktop_machine_id = $1 WHERE id = $2').run(desktopMachineId, empresaId)
+      console.log(`[rebind-desktop] empresa ${empresaId}: ${empresa.desktop_machine_id || '(sin previo)'} → ${desktopMachineId}`)
+      return json(res, 200, { success: true, empresa_id: empresaId, desktop_machine_id: desktopMachineId })
+    }
+
+    // Re-vinculación del teléfono (OmniServ) — comportamiento original
+    if (!deviceFingerprint || !/^[a-fA-F0-9]{16,128}$/.test(deviceFingerprint)) {
+      return json(res, 400, { success: false, error: 'device_fingerprint requerido (hex 16-128 chars) o desktop_machine_id requerido (hex 8-128 chars)' })
     }
 
     const limiteFecha = new Date(Date.now() - DEVICE_CHANGE_COOLDOWN_HOURS * 3600_000).toISOString().replace('T', ' ').slice(0, 19)
@@ -1131,7 +1146,7 @@ async function handle(req, res) {
     }
 
     const antiguo = empresa.device_fingerprint
-    await db.prepare('UPDATE empresas SET device_fingerprint = $1 WHERE id = $2').run(nuevo, empresaId)
+    await db.prepare('UPDATE empresas SET device_fingerprint = $1 WHERE id = $2').run(deviceFingerprint, empresaId)
 
     await db.prepare(
       `INSERT INTO device_fingerprint_audit
@@ -1142,16 +1157,16 @@ async function handle(req, res) {
       null,
       empresa.email_contacto || null,
       antiguo,
-      nuevo,
+      deviceFingerprint,
       'Re-vinculación desde el cliente',
       ip,
       String(req.headers['user-agent'] || '').slice(0, 200),
     )
 
-    console.log(`[rebind] empresa ${empresaId}: ${antiguo || '(sin previo)'} → ${nuevo}`)
-    sendDeviceChangeEmail(empresa, nuevo, 'Re-vinculación desde el cliente').catch(() => {})
+    console.log(`[rebind] empresa ${empresaId}: ${antiguo || '(sin previo)'} → ${deviceFingerprint}`)
+    sendDeviceChangeEmail(empresa, deviceFingerprint, 'Re-vinculación desde el cliente').catch(() => {})
 
-    return json(res, 200, { success: true, empresa_id: empresaId, device_fingerprint: nuevo })
+    return json(res, 200, { success: true, empresa_id: empresaId, device_fingerprint: deviceFingerprint })
   }
 
   // GET /api/admin/empresas/:id/audit/dispositivo (admin)
@@ -1906,6 +1921,24 @@ async function handle(req, res) {
           code: 'DEVICE_MISMATCH',
           error: 'Dispositivo no autorizado',
           message: 'Esta licencia ya está activada en otro dispositivo. Contacta soporte para transferir la licencia.',
+        })
+      }
+    }
+
+    // Validación separada para TOG Admin desktop: x-machine-id vs desktop_machine_id
+    const machineId = String(req.headers['x-machine-id'] || '').trim()
+    if (machineId) {
+      if (!empresa.desktop_machine_id) {
+        // Primera vez: vincula esta PC a la empresa
+        await db
+          .prepare('UPDATE empresas SET desktop_machine_id = $1 WHERE id = $2 AND desktop_machine_id IS NULL')
+          .run(machineId, empresa.id)
+      } else if (machineId !== empresa.desktop_machine_id) {
+        return json(res, 403, {
+          success: false,
+          code: 'DESKTOP_MISMATCH',
+          error: 'Dispositivo de escritorio no autorizado',
+          message: 'Esta licencia ya está activada en otro equipo. Contacta soporte para transferir.',
         })
       }
     }

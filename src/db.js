@@ -16,6 +16,8 @@ export const isPostgres = !!process.env.DATABASE_URL
 const MIGRACIONES_POSTGRES = [
   // FASE 5: vínculo de la empresa con el vendedor que la trajo (ID humano OMV-XXXXX).
   'ALTER TABLE empresas ADD COLUMN IF NOT EXISTS vendedor_id TEXT',
+  // Separación de device_fingerprint (OmniServ Android) y desktop_machine_id (TOG Admin desktop).
+  'ALTER TABLE empresas ADD COLUMN IF NOT EXISTS desktop_machine_id TEXT',
 ]
 
 // Tablas del backend. Se usan para verificar RLS en Postgres (Supabase).

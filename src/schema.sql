@@ -10,6 +10,8 @@ CREATE TABLE IF NOT EXISTS empresas (
   email_contacto     TEXT NOT NULL,
   api_key            TEXT UNIQUE NOT NULL,
   device_fingerprint TEXT,
+  -- Machine ID de TOG Admin (desktop). Separado de device_fingerprint (OmniServ Android).
+  desktop_machine_id TEXT,
   payment_status     TEXT DEFAULT 'pending',
   payment_confirmed_at TEXT,
   -- ID de vendedor que trajo al cliente, con el formato humano OMV-XXXXX
