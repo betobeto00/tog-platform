@@ -238,6 +238,44 @@ test('emisión manual acepta los nuevos módulos administracion y rrhh', async (
   assert.equal(verifySignature(licencia), true, 'la firma debe cubrir los nuevos módulos')
 })
 
+test('GET /api/admin/empresas/:id devuelve detalle, licencias y estado (lo consume el CLI)', async () => {
+  const sinKey = await fetch(base + `/api/admin/empresas/${empresa.id}`)
+  assert.equal(sinKey.status, 401)
+
+  const detalle = await fetch(base + `/api/admin/empresas/${empresa.id}`, { headers: adminHeaders })
+  assert.equal(detalle.status, 200)
+  const body = await detalle.json()
+  assert.equal(body.empresa.nombre, 'AgroMaíz C.A.')
+  assert.equal(body.empresa.documento, 'J-12345678-9')
+  assert.ok(Array.isArray(body.licencias) && body.licencias.length >= 3, 'acumula el historial de licencias')
+  assert.ok(Array.isArray(body.vigente.modules), 'la licencia vigente expone sus módulos ya parseados')
+  assert.equal(body.vigente.estado, 'vigente')
+  assert.ok(Array.isArray(body.dispositivo))
+
+  const inexistente = await fetch(base + '/api/admin/empresas/999999', { headers: adminHeaders })
+  assert.equal(inexistente.status, 404)
+})
+
+test('el detalle marca como vencida una licencia con fecha pasada', async () => {
+  const creada = await post(
+    '/api/empresas',
+    { nombre: 'Vencida S.A.', pais: 'CL', documento: '76.111.222-3', email_contacto: 'v@x.com' },
+    adminHeaders,
+  )
+  assert.equal(creada.status, 201)
+
+  await post(
+    `/api/empresas/${creada.json.id}/licencias`,
+    { cliente: 'Vencida S.A.', expira: '2000-01-01', modules: ['distribuidor'] },
+    adminHeaders,
+  )
+
+  const detalle = await fetch(base + `/api/admin/empresas/${creada.json.id}`, { headers: adminHeaders })
+  const body = await detalle.json()
+  assert.equal(body.vigente, null, 'una licencia vencida no es la vigente')
+  assert.equal(body.licencias[0].estado, 'vencida')
+})
+
 test('las rutas de Stripe ya no existen (proveedor único: Crixto)', async () => {
   const checkout = await post('/api/checkout-session', { modulo: 'distribuidor' }, {
     'x-api-key': empresa.api_key,

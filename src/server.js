@@ -998,6 +998,46 @@ async function handle(req, res) {
     return json(res, 200, { empresas: rows })
   }
 
+  // GET /api/admin/empresas/:id (admin) — detalle de una empresa con su
+  // licencia vigente, historial de licencias y cambios de dispositivo.
+  // Es lo que consume `omni license status --id <ID>`.
+  const adminEmpresaMatch = path.match(/^\/api\/admin\/empresas\/(\d+)$/)
+  if (method === 'GET' && adminEmpresaMatch) {
+    if (!(await requireAdmin(req, res))) return
+    const empresaId = Number(adminEmpresaMatch[1])
+    const empresa = await db
+      .prepare('SELECT id, nombre, pais, documento, email_contacto, device_fingerprint, payment_status, created_at FROM empresas WHERE id = $1')
+      .get(empresaId)
+    if (!empresa) return json(res, 404, { success: false, error: `Empresa #${empresaId} no encontrada` })
+
+    const licencias = await db
+      .prepare(`SELECT id, modules, max_usuarios, max_sucursales, issued_at, expires_at,
+                       revoked_at, motivo_revocado, emitida_por
+                FROM licencias WHERE empresa_id = $1 ORDER BY issued_at DESC, id DESC`)
+      .all(empresaId)
+
+    const ahora = new Date().toISOString().slice(0, 10)
+    const conEstado = licencias.map((l) => {
+      let modulos = []
+      try { modulos = JSON.parse(l.modules || '[]') } catch {}
+      const vencida = typeof l.expires_at === 'string' && l.expires_at.slice(0, 10) < ahora
+      return {
+        ...l,
+        modules: Array.isArray(modulos) ? modulos : [],
+        estado: l.revoked_at ? 'revocada' : vencida ? 'vencida' : 'vigente',
+      }
+    })
+    const vigente = conEstado.find((l) => l.estado === 'vigente') || null
+
+    const dispositivo = await db
+      .prepare(`SELECT admin_email, fingerprint_antiguo, fingerprint_nuevo, razon, created_at
+                FROM device_fingerprint_audit WHERE empresa_id = $1
+                ORDER BY created_at DESC, id DESC LIMIT 5`)
+      .all(empresaId)
+
+    return json(res, 200, { empresa, vigente, licencias: conEstado, dispositivo })
+  }
+
   // POST /api/admin/empresas/:id/dispositivo (admin) — cambia el dispositivo
   // autorizado. Queda auditado (cuándo, por qué, desde qué IP y con qué key) y
   // se avisa por email al dueño; con enfriamiento de 24h por empresa.

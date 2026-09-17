@@ -150,6 +150,7 @@ Variables de entorno (ver [`.env.example`](./.env.example)): obligatorias
 | `GET` | `/api/health` | — | Estado (DB + clave de firma) |
 | `POST` | `/api/empresas` | `X-Admin-Key` | Alta de empresa: `{ nombre, pais?, documento, email_contacto }` → genera `api_key` |
 | `GET` | `/api/admin/empresas` | `X-Admin-Key` | Listado de empresas |
+| `GET` | `/api/admin/empresas/:id` | `X-Admin-Key` | Detalle de una empresa: datos, licencia vigente, historial de licencias (con estado vigente/vencida/revocada) y cambios de dispositivo. Lo consume `omni license status --id <ID>` |
 | `POST` | `/api/empresas/:id/licencias` | `X-Admin-Key` | Emisión manual de licencia firmada `{ cliente, expira, modules?, max_pcs? }`. `max_pcs` 1–20 (default 1) habilita el módulo Red Local en tog-admin |
 | `GET` | `/api/empresas/:id/licencia` | `X-Api-Key` | Licencia activa para el botón “Sincronizar” de la app |
 | `POST` | `/api/payment/omniserv-intent` | `X-Api-Key` | Intención de pago de OmniServ → URL de retorno firmada (hmac + ts) |
